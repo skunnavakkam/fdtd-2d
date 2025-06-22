@@ -108,7 +108,7 @@ def make_video_from_frames():
     except subprocess.CalledProcessError as e:
         print(f"Error creating video: {e.stderr.decode()}")
 
-def capture_snapshot(Ez, path, vmax=20, vmin=-20):
+def capture_snapshot(Ez, eps, path, vmax=20, vmin=-20):
     # Normalize to [-1, 1]
     print(np.max(Ez), np.min(Ez))
 
@@ -166,6 +166,6 @@ if __name__ == "__main__":
 
         if i % (nsteps // nframes) == 0:
             frame_num = i // (nsteps // nframes)
-            capture_snapshot(Ez, f"frames/frame_{frame_num:04d}.png", 10e-5, -10e-5) 
+            capture_snapshot(Ez, eps, f"frames/frame_{frame_num:04d}.png", 10e-5, -10e-5) 
 
     make_video_from_frames()
