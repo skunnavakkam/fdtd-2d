@@ -25,6 +25,17 @@ class RegionDrawer:
         ]
         self.draw.ellipse(outer_bbox, outline=0, width=ring_width)
 
+    def draw_sphere(self, center: tuple[int,int], radius: int, sphere_width: int):
+        """Draw a sphere centered at given point."""
+        # Draw outer circle
+        outer_bbox = [
+            center[0] - radius - sphere_width//2,
+            center[1] - radius - sphere_width//2,
+            center[0] + radius + sphere_width//2, 
+            center[1] + radius + sphere_width//2
+        ]
+        self.draw.ellipse(outer_bbox, fill="black")
+
     def draw_curved_waveguide(self, start: tuple[int,int], end: tuple[int,int], 
                             control_point: tuple[int,int], width: int):
         """Draw a curved waveguide using a quadratic Bezier curve."""
@@ -62,18 +73,13 @@ class RegionDrawer:
 # Example usage:
 if __name__ == "__main__":
     # Create a 500x500 canvas
-    drawer = RegionDrawer(500, 500)
-    
-    # Draw a simple ring resonator with bus waveguide
-    center = (250, 273)
-    radius = 150
-    ring_width = 20
+    drawer = RegionDrawer(5000, 5000)
     
     # Draw the ring
-    drawer.draw_ring_resonator(center, radius, ring_width)
+    # drawer.draw_ring_resonator(center, radius, ring_width)
+    drawer.draw_sphere((5000// 3, 5000//2), 5000//5, 20)
     
     # Draw a bus waveguide
-    drawer.draw_waveguide((10, 100), (490, 100), 20)
     
     # Save the result
-    drawer.save("example_structure.png")
+    drawer.save("high_res_sphere.png")

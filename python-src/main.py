@@ -76,21 +76,38 @@ def grid_init(rows: int, cols: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]
     # Returns Ez, Hx, Hy
     return np.zeros((rows, cols)), np.zeros((rows, cols -1 )), np.zeros((rows - 1, cols))
 
-def material_init(path: str | None, rows: int, cols: int, black_point: float = 1.3) -> tuple[np.ndarray, np.ndarray]:
-    # Load and resize the material map
+def material_init(path: str | None, rows: int, cols: int, black_point: float = 10.0) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Initialize permittivity (eps) and permeability (mu) grids from an optional grayscale image.
+
+    If `path` is None, returns uniform eps=epsilon0 and mu=mu0 arrays.
+    Otherwise, loads the image, resizes to (cols, rows), and maps pixel intensity so that
+    black (0) -> high permittivity (black_point * epsilon0), and
+    white (255) -> low permittivity (1 * epsilon0).
+    """
+    # Constants
+    epsilon0 = 8.85418e-12  # Vacuum permittivity
+    mu0 = 4 * np.pi * 1e-7  # Vacuum permeability
+
     if path is None:
-        return np.ones((rows, cols)) * 8.85418e-12, np.ones((rows, cols)) * 4 * np.pi * 1e-7
-    
-    img = Image.open(path)
-    img = img.convert('L')  # Convert to grayscale
+        eps = np.ones((rows, cols)) * epsilon0
+        mu = np.ones((rows, cols)) * mu0
+        return eps, mu
+
+    # Load image as grayscale and resize
+    img = Image.open(path).convert('L')
     img = img.resize((cols, rows), Image.LANCZOS)
-    
-    # Convert to numpy arrays and normalize
-    eps = 1 + (black_point - 1) * np.array(img) / 255.0  # Scale from 1 to black_point
-    mu = np.ones((rows, cols))   # Permeability defaults to 1
-    
-    eps *= 8.85418e-12 # value of vacuum permittivity
-    mu *= 4 * np.pi * 1e-7 # value of vacuum permeability
+    arr = np.array(img, dtype=float) / 255.0  # Normalize to [0,1]
+
+    # Invert mapping: black (0) -> 1.0, white (1) -> 0.0
+    inv = 1.0 - arr
+
+    # Map to [1, black_point]
+    factor = 1 + (black_point - 1) * inv
+
+    # Compute eps and mu arrays
+    eps = factor * epsilon0
+    mu = np.ones((rows, cols)) * mu0
 
     return eps, mu
 
@@ -117,8 +134,6 @@ def make_video_from_frames():
 
 def capture_snapshot(Ez, eps, path, vmax=20, vmin=-20):
     # Normalize to [-1, 1]
-    # print(np.max(Ez), np.min(Ez))
-
     normed = np.clip(Ez, vmin, vmax)
 
     # Create background grayscale image from eps
@@ -128,20 +143,21 @@ def capture_snapshot(Ez, eps, path, vmax=20, vmin=-20):
         eps_gray = np.full_like(eps, 255, dtype=np.uint8)  # White if uniform
     else:
         eps_normed = (eps - eps_min) / (eps_max - eps_min)
-        eps_gray = (eps_normed * 128 + 127).astype(np.uint8) # Scale to 127-255 (light gray to white)
+        # Scale to 128-255 (gray to white) - high permittivity is gray
+        eps_gray = ((1 - eps_normed) * 127 + 128).astype(np.uint8)
     
     # Create RGB array with eps as background
     background = np.stack([eps_gray]*3, axis=-1)
     
-    # Map Ez through colormap
+    # Map Ez through colormap with alpha=0.7
     cmap = cm.get_cmap('seismic')   # blue-white-red
     rgba = cmap((normed - vmin) / (vmax - vmin))
-    rgb = (rgba[:, :, :3] * 255).astype(np.uint8)
-
-    # Blend Ez values with background where significant
-    mask = np.abs(normed) > (vmax - vmin) * 0.05  # 5% threshold
-    mask = np.stack([mask]*3, axis=-1)
-    final = np.where(mask, rgb, background)
+    rgba[..., 3] = 0.7  # Set alpha to 0.7
+    
+    # Convert to RGB with alpha blending
+    rgb_float = rgba[..., :3] * rgba[..., 3:] + \
+                (background / 255) * (1 - rgba[..., 3:])
+    final = (rgb_float * 255).astype(np.uint8)
 
     Image.fromarray(final).save(path)
 
@@ -159,16 +175,17 @@ def sinusoidal(rows, cols, x_pos, y_pos, t, fc):
     src[x_pos, y_pos] = envelope * np.sin(2 * np.pi * fc * t)
     return src
 
+
 if __name__ == "__main__":
-    rows = 1000
-    cols = 1000
-    dt = 5e-13
-    dx = 5e-4
+    rows = 500
+    cols = 500
+    dt = 1e-12
+    dx = 1e-3
     nsteps = 10000
     nframes = 200
 
     Ez, Hx, Hy = grid_init(rows, cols)
-    eps, mu = material_init("example_structure.png", rows, cols)
+    eps, mu = material_init("high_res_sphere.png", rows, cols)
 
     # Check Courant stability condition
     c = 1 / np.sqrt(eps.min() * mu.min())  # Speed of light in material
@@ -184,10 +201,10 @@ if __name__ == "__main__":
 
         Ez += sinusoidal(rows, 
                         cols, 
-                        200, 
+                        100, 
                         50, 
                         i * dt, 
-                        318e9)
+                        300e9)
 
 
         if i % (nsteps // nframes) == 0:
