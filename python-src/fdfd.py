@@ -84,21 +84,103 @@ def plot_nonzero(A):
     plt.close()
 
 
-def _solve_patch(eps, mu, dx, dy, omega, source, pml_thickness=5):
-    """Direct FDFD solve on one patch *including* its local PML."""
+def _extract_dirichlet_bc(sol_patch: np.ndarray, halo: int):
+    """Return (top, bottom, left, right) field arrays from the outermost ring."""
+    top = sol_patch[halo, halo:-halo].copy()
+    bottom = sol_patch[-halo - 1, halo:-halo].copy()
+    left = sol_patch[halo:-halo, halo].copy()
+    right = sol_patch[halo:-halo, -halo - 1].copy()
+    return top, bottom, left, right
 
+
+def _solve_patch(
+    eps,
+    mu,
+    dx,
+    dy,
+    omega,
+    source,
+    *,
+    pml_thickness: int = 5,
+    dirichlet_bc=None,  # NEW – pass (top, bottom, left, right) or None
+):
+    """
+    Direct FDFD solve on one patch *including* its local PML.
+
+    Parameters
+    ----------
+    dirichlet_bc : None | tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]
+        Fixed Ez values on the outermost cell ring (top, bottom, left, right).
+        Each array is 1-D and already matches the length of that edge.
+        If None (default) no extra Dirichlet rows are imposed.
+    """
+    # ------------------------------------------------------------------
+    # 0. basic checks
+    # ------------------------------------------------------------------
     assert eps.shape == mu.shape == source.shape, "shape mismatch"
+    Nx, Ny = eps.shape
+    halo = pml_thickness
 
+    # ------------------------------------------------------------------
+    # 1. Assemble the standard Helmholtz matrix for this patch
+    # ------------------------------------------------------------------
     A = make_A(
         eps,
         mu,
         dx,
         dy,
-        *eps.shape,
+        Nx,
+        Ny,
         omega,
         pml_thickness=pml_thickness,
     )
-    b = -1j * omega * source.ravel()
+    b = (-1j * omega * source).ravel()  # column vector
+
+    # ------------------------------------------------------------------
+    # 2. Impose Dirichlet rows if requested
+    # ------------------------------------------------------------------
+    if dirichlet_bc is not None:
+        top, bottom, left, right = dirichlet_bc
+        A = A.tolil()  # easier to edit rows
+        idx = lambda i, j: i * Ny + j  # 2-D → 1-D mapping
+
+        # --- top edge (y = halo) ---
+        i = halo
+        for j, val in zip(range(halo, Ny - halo), top):
+            k = idx(i, j)
+            A.rows[k] = [k]
+            A.data[k] = [1.0]
+            b[k] = val
+
+        # --- bottom edge (y = Ny-halo-1) ---
+        i = Nx - halo - 1
+        for j, val in zip(range(halo, Ny - halo), bottom):
+            k = idx(i, j)
+            A.rows[k] = [k]
+            A.data[k] = [1.0]
+            b[k] = val
+
+        # --- left edge (x = halo) ---
+        j = halo
+        for i, val in zip(range(halo, Nx - halo), left):
+            k = idx(i, j)
+            A.rows[k] = [k]
+            A.data[k] = [1.0]
+            b[k] = val
+
+        # --- right edge (x = Ny-halo-1) ---
+        j = Ny - halo - 1
+        for i, val in zip(range(halo, Nx - halo), right):
+            k = idx(i, j)
+            A.rows[k] = [k]
+            A.data[k] = [1.0]
+            b[k] = val
+
+        A = A.tocsc()  # back to efficient format
+
+    # ------------------------------------------------------------------
+    # 3. Direct solve
+    # ------------------------------------------------------------------
     Ez = scipy.sparse.linalg.spsolve(A, b).reshape(eps.shape)
     return Ez
 
@@ -115,32 +197,28 @@ def run_fdfd(
     source,
     *,
     patch_size: int = 100,
-    padding: int = 10,
-    pml_thickness: int = 5,
+    padding: int = 30,
+    pml_thickness: int = 10,  # ↑ a bit thicker for better BCs
 ):
     """
-    Solve the 2‑D FDFD problem by tiling the domain into partially
-    overlapping patches (each including its own PML halo).
-
-    * Every patch is clamped to the simulation window – no negative
-      indices are produced.
-    * Patches that would collapse to zero (smaller than twice the halo
-      thickness in either dimension) are skipped.
-    * When the local solution is written back only the interior
-      (everything outside the PML halo) is copied, so the public halo
-      width naturally follows ``pml_thickness``.
+    One-pass tiled FDFD solve with correct RHS and Dirichlet halo exchange.
+    Everything else (patch layout, ordering) matches your original draft.
     """
-
     Nx, Ny = eps.shape
     assert eps.shape == mu.shape == source.shape, "shape mismatch"
 
+    halo = pml_thickness
+    inner = slice(halo, -halo or None)  # interior slice within a patch
+    orig_source = source.copy()  # fixed RHS
+    solution = np.zeros_like(source)  # start from zero field
+
     # ------------------------------------------------------------------
-    # 1. Generate a regular grid of patch centres.
+    # 1. Generate patches exactly as before
     # ------------------------------------------------------------------
     x_centers = range(patch_size // 2, Nx, patch_size)
     y_centers = range(patch_size // 2, Ny, patch_size)
 
-    patches = []  # type: list[Patch]
+    patches = []
     for cx in x_centers:
         for cy in y_centers:
             x_min = max(0, cx - patch_size // 2 - padding)
@@ -148,129 +226,70 @@ def run_fdfd(
             y_min = max(0, cy - patch_size // 2 - padding)
             y_max = min(Ny, cy + patch_size // 2 + padding)
 
-            # Discard degenerate patches (need room for two halos).
-            if (x_max - x_min) <= 2 * pml_thickness or (
-                y_max - y_min
-            ) <= 2 * pml_thickness:
+            if (x_max - x_min) <= 2 * halo or (y_max - y_min) <= 2 * halo:
                 continue
-
-            patches.append(Patch((x_min, y_min), (x_max, y_max)))
+            patches.append(((x_min, y_min), (x_max, y_max)))
 
     # ------------------------------------------------------------------
-    # 2. Label patches by topological distance from any that contain the
-    #    *non‑zero* part of the source in their *interior* region.
+    # 2. Distance-sort outward from any patch whose *interior* touches RHS
     # ------------------------------------------------------------------
-    source_patches = set()
-    patches_with_dist = []
-
-    halo = pml_thickness  # shorthand
+    source_bool = orig_source != 0
+    patches_with_dist, frontier, visited = [], set(), set()
 
     for idx, patch in enumerate(patches):
-        (x_min, y_min), (x_max, y_max) = patch
-        # interior region excludes the padding / halo
-        ix_min, ix_max = x_min + halo, x_max - halo
-        iy_min, iy_max = y_min + halo, y_max - halo
-
-        # Clamp to valid domain before indexing.
-        xs = slice(ix_min, ix_max)
-        ys = slice(iy_min, iy_max)
-
-        if np.any(source[xs, ys] != 0):
-            source_patches.add(idx)
+        (a0, b0), (a1, b1) = patch
+        if np.any(source_bool[a0 + halo : a1 - halo, b0 + halo : b1 - halo]):
             patches_with_dist.append((patch, 0))
+            frontier.add(idx)
+            visited.add(idx)
 
-    # Breadth‑first search to propagate outward.
-    visited = set(source_patches)
-    frontier = set(source_patches)
-    current_d = 0
+    d = 0
     while frontier and len(visited) < len(patches):
-        current_d += 1
-        next_frontier = set()
-
+        d += 1
+        nxt = set()
         for i in frontier:
-            (x1_min, y1_min), (x1_max, y1_max) = patches[i]
-
+            (x0, y0), (x1, y1) = patches[i]
             for j, p2 in enumerate(patches):
-                if j in visited:
+                if j in visited:  # already labelled
                     continue
-                (x2_min, y2_min), (x2_max, y2_max) = p2
-
-                # axis‑aligned bounding boxes overlap → adjacency
-                if (
-                    x1_min <= x2_max
-                    and x2_min <= x1_max
-                    and y1_min <= y2_max
-                    and y2_min <= y1_max
-                ):
+                (u0, v0), (u1, v1) = p2
+                if x0 <= u1 and u0 <= x1 and y0 <= v1 and v0 <= y1:
                     visited.add(j)
-                    next_frontier.add(j)
-                    patches_with_dist.append((p2, current_d))
+                    nxt.add(j)
+                    patches_with_dist.append((p2, d))
+        frontier = nxt
 
-        frontier = next_frontier
-
-    # Ensure distance‑sorted order.
-    patches_with_dist.sort(key=lambda t: t[1])
+    patches_with_dist.sort(key=lambda t: t[1])  # ensure outward order
 
     # ------------------------------------------------------------------
-    # 3. Patch‑wise solves, writing back only the inner region.
+    # 3. Single outward sweep
     # ------------------------------------------------------------------
-    solution = source.copy()
+    for patch, _dist in patches_with_dist:
+        (x0, y0), (x1, y1) = patch
 
-    inner_src = slice(halo, -halo or None)
+        # materials & RHS
+        p_eps = eps[x0:x1, y0:y1]
+        p_mu = mu[x0:x1, y0:y1]
+        p_source = orig_source[x0:x1, y0:y1]
 
-    for patch_idx, (patch, _dist) in enumerate(patches_with_dist):
-        (x_min, y_min), (x_max, y_max) = patch
+        # current global field over the patch → Dirichlet ring
+        sol_patch = solution[x0:x1, y0:y1]
+        bc = _extract_dirichlet_bc(sol_patch, halo)
 
-        # Plot current patch being solved
-        plt.figure(figsize=(12, 5))
-        plt.subplot(121)
-        plt.imshow(np.abs(solution), cmap="viridis")
-        plt.colorbar(label="|Ez|")
-        plt.title(f"Solution before patch {patch_idx}")
-
-        # Highlight current patch
-        rect = plt.Rectangle(
-            (y_min, x_min),
-            y_max - y_min,
-            x_max - x_min,
-            fill=False,
-            color="red",
-            linewidth=2,
-        )
-        plt.gca().add_patch(rect)
-
-        patch_eps = eps[x_min:x_max, y_min:y_max]
-        patch_mu = mu[x_min:x_max, y_min:y_max]
-        patch_source = solution[x_min:x_max, y_min:y_max]
-
-        patch_sol = _solve_patch(
-            patch_eps, patch_mu, dx, dy, omega, patch_source, pml_thickness=halo
+        # local solve (needs new kw-arg)
+        p_sol = _solve_patch(
+            p_eps,
+            p_mu,
+            dx,
+            dy,
+            omega,
+            p_source,
+            pml_thickness=halo,
+            dirichlet_bc=bc,  # ← NEW
         )
 
-        solution[
-            x_min + halo : x_max - halo,
-            y_min + halo : y_max - halo,
-        ] = patch_sol[inner_src, inner_src]
-
-        # Plot solution after solving this patch
-        plt.subplot(122)
-        plt.imshow(np.abs(solution), cmap="viridis")
-        plt.colorbar(label="|Ez|")
-        plt.title(f"Solution after patch {patch_idx}")
-
-        # Highlight current patch
-        rect = plt.Rectangle(
-            (y_min, x_min),
-            y_max - y_min,
-            x_max - x_min,
-            fill=False,
-            color="red",
-            linewidth=2,
-        )
-        plt.gca().add_patch(rect)
-
-        plt.tight_layout()
-        plt.show()
+        # overwrite interior (no relaxation)
+        solution[x0 + halo : x1 - halo, y0 + halo : y1 - halo] = p_sol[inner, inner]
 
     return solution
 
