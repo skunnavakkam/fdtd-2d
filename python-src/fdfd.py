@@ -1,6 +1,8 @@
 import numpy as np
 import scipy.sparse as sparse
 import scipy.sparse as sp
+import scipy.sparse.linalg as spla
+import scipy
 from scipy.linalg import solve_banded
 from main import material_init
 from utils import plot_Ez
@@ -8,6 +10,7 @@ import matplotlib.pyplot as plt
 import time
 import pyamg
 from collections import deque
+from collections import namedtuple
 
 
 def solve_linear(A, b):
@@ -81,56 +84,200 @@ def plot_nonzero(A):
     plt.close()
 
 
-def run_fdfd(eps, mu, dx, dy, omega, source, patch_size=100):
-    patches = []
-    # Split the source into 100x100 patches
-    Nx, Ny = source.shape
+def _solve_patch(eps, mu, dx, dy, omega, source, pml_thickness=5):
+    """Direct FDFD solve on one patch *including* its local PML."""
 
-    # Calculate number of patches in each dimension
-    n_patches_x = (Nx + patch_size - 1) // patch_size  # Ceiling division
-    n_patches_y = (Ny + patch_size - 1) // patch_size
+    assert eps.shape == mu.shape == source.shape, "shape mismatch"
 
-    # Split into patches
-    for i in range(n_patches_x):
-        for j in range(n_patches_y):
-            # Calculate patch boundaries
-            x_start = i * patch_size
-            x_end = min((i + 1) * patch_size, Nx)
-            y_start = j * patch_size
-            y_end = min((j + 1) * patch_size, Ny)
+    A = make_A(
+        eps,
+        mu,
+        dx,
+        dy,
+        *eps.shape,
+        omega,
+        pml_thickness=pml_thickness,
+    )
+    b = -1j * omega * source.ravel()
+    Ez = scipy.sparse.linalg.spsolve(A, b).reshape(eps.shape)
+    return Ez
 
-            # Extract patch
-            patch = source[x_start:x_end, y_start:y_end]
-            patches.append(patch)
 
-    # Find patches with nonzero source
-    nonzero_patches = []
-    patch_locations = []
+Patch = namedtuple("Patch", ["top_left", "bottom_right"])
+
+
+def run_fdfd(
+    eps,
+    mu,
+    dx,
+    dy,
+    omega,
+    source,
+    *,
+    patch_size: int = 100,
+    padding: int = 10,
+    pml_thickness: int = 5,
+):
+    """
+    Solve the 2‑D FDFD problem by tiling the domain into partially
+    overlapping patches (each including its own PML halo).
+
+    * Every patch is clamped to the simulation window – no negative
+      indices are produced.
+    * Patches that would collapse to zero (smaller than twice the halo
+      thickness in either dimension) are skipped.
+    * When the local solution is written back only the interior
+      (everything outside the PML halo) is copied, so the public halo
+      width naturally follows ``pml_thickness``.
+    """
+
+    Nx, Ny = eps.shape
+    assert eps.shape == mu.shape == source.shape, "shape mismatch"
+
+    # ------------------------------------------------------------------
+    # 1. Generate a regular grid of patch centres.
+    # ------------------------------------------------------------------
+    x_centers = range(patch_size // 2, Nx, patch_size)
+    y_centers = range(patch_size // 2, Ny, patch_size)
+
+    patches = []  # type: list[Patch]
+    for cx in x_centers:
+        for cy in y_centers:
+            x_min = max(0, cx - patch_size // 2 - padding)
+            x_max = min(Nx, cx + patch_size // 2 + padding)
+            y_min = max(0, cy - patch_size // 2 - padding)
+            y_max = min(Ny, cy + patch_size // 2 + padding)
+
+            # Discard degenerate patches (need room for two halos).
+            if (x_max - x_min) <= 2 * pml_thickness or (
+                y_max - y_min
+            ) <= 2 * pml_thickness:
+                continue
+
+            patches.append(Patch((x_min, y_min), (x_max, y_max)))
+
+    # ------------------------------------------------------------------
+    # 2. Label patches by topological distance from any that contain the
+    #    *non‑zero* part of the source in their *interior* region.
+    # ------------------------------------------------------------------
+    source_patches = set()
+    patches_with_dist = []
+
+    halo = pml_thickness  # shorthand
+
     for idx, patch in enumerate(patches):
-        if np.any(patch != 0):
-            nonzero_patches.append(patch)
-            # Calculate patch location from index
-            patch_i = idx // n_patches_y  # Row index
-            patch_j = idx % n_patches_y  # Column index
-            patch_locations.append((patch_i, patch_j))
+        (x_min, y_min), (x_max, y_max) = patch
+        # interior region excludes the padding / halo
+        ix_min, ix_max = x_min + halo, x_max - halo
+        iy_min, iy_max = y_min + halo, y_max - halo
 
-    # Plot the nonzero patches to visualize their locations
-    plt.figure(figsize=(10, 10))
-    patch_map = np.zeros((n_patches_x, n_patches_y))
-    for i, j in patch_locations:
-        patch_map[i, j] = 1
-    plt.imshow(patch_map, cmap="binary")
-    plt.colorbar()
-    plt.title("Nonzero Source Patch Locations")
-    plt.xlabel("Patch Column Index")
-    plt.ylabel("Patch Row Index")
-    plt.savefig("nonzero_patches.png", dpi=300, bbox_inches="tight")
-    plt.close()
+        # Clamp to valid domain before indexing.
+        xs = slice(ix_min, ix_max)
+        ys = slice(iy_min, iy_max)
+
+        if np.any(source[xs, ys] != 0):
+            source_patches.add(idx)
+            patches_with_dist.append((patch, 0))
+
+    # Breadth‑first search to propagate outward.
+    visited = set(source_patches)
+    frontier = set(source_patches)
+    current_d = 0
+    while frontier and len(visited) < len(patches):
+        current_d += 1
+        next_frontier = set()
+
+        for i in frontier:
+            (x1_min, y1_min), (x1_max, y1_max) = patches[i]
+
+            for j, p2 in enumerate(patches):
+                if j in visited:
+                    continue
+                (x2_min, y2_min), (x2_max, y2_max) = p2
+
+                # axis‑aligned bounding boxes overlap → adjacency
+                if (
+                    x1_min <= x2_max
+                    and x2_min <= x1_max
+                    and y1_min <= y2_max
+                    and y2_min <= y1_max
+                ):
+                    visited.add(j)
+                    next_frontier.add(j)
+                    patches_with_dist.append((p2, current_d))
+
+        frontier = next_frontier
+
+    # Ensure distance‑sorted order.
+    patches_with_dist.sort(key=lambda t: t[1])
+
+    # ------------------------------------------------------------------
+    # 3. Patch‑wise solves, writing back only the inner region.
+    # ------------------------------------------------------------------
+    solution = source.copy()
+
+    inner_src = slice(halo, -halo or None)
+
+    for patch_idx, (patch, _dist) in enumerate(patches_with_dist):
+        (x_min, y_min), (x_max, y_max) = patch
+
+        # Plot current patch being solved
+        plt.figure(figsize=(12, 5))
+        plt.subplot(121)
+        plt.imshow(np.abs(solution), cmap="viridis")
+        plt.colorbar(label="|Ez|")
+        plt.title(f"Solution before patch {patch_idx}")
+
+        # Highlight current patch
+        rect = plt.Rectangle(
+            (y_min, x_min),
+            y_max - y_min,
+            x_max - x_min,
+            fill=False,
+            color="red",
+            linewidth=2,
+        )
+        plt.gca().add_patch(rect)
+
+        patch_eps = eps[x_min:x_max, y_min:y_max]
+        patch_mu = mu[x_min:x_max, y_min:y_max]
+        patch_source = solution[x_min:x_max, y_min:y_max]
+
+        patch_sol = _solve_patch(
+            patch_eps, patch_mu, dx, dy, omega, patch_source, pml_thickness=halo
+        )
+
+        solution[
+            x_min + halo : x_max - halo,
+            y_min + halo : y_max - halo,
+        ] = patch_sol[inner_src, inner_src]
+
+        # Plot solution after solving this patch
+        plt.subplot(122)
+        plt.imshow(np.abs(solution), cmap="viridis")
+        plt.colorbar(label="|Ez|")
+        plt.title(f"Solution after patch {patch_idx}")
+
+        # Highlight current patch
+        rect = plt.Rectangle(
+            (y_min, x_min),
+            y_max - y_min,
+            x_max - x_min,
+            fill=False,
+            color="red",
+            linewidth=2,
+        )
+        plt.gca().add_patch(rect)
+
+        plt.tight_layout()
+        plt.show()
+
+    return solution
 
 
 if __name__ == "__main__":
-    Nx = 1001
-    Ny = 1001
+    Nx = 1000
+    Ny = 1000
     dx = dy = 1e-3
     omega = 17e9
 
@@ -172,3 +319,11 @@ if __name__ == "__main__":
     # print(sp.linalg.spbandwidth(permuted_A))
 
     Ez_new = run_fdfd(eps, mu, dx, dy, omega, source)
+    plot_Ez(
+        Ez_new,
+        eps,
+        source,
+        "Ez_tiled.png",
+        np.max(np.abs(Ez_new)),
+        -np.max(np.abs(Ez_new)),
+    )
