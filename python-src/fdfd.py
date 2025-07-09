@@ -11,60 +11,243 @@ import time
 import pyamg
 from collections import deque
 from collections import namedtuple
+import jax
+import jax.numpy as jnp
+from jax.experimental import sparse as jsparse
+from jax import lax
+from jax.scipy.sparse.linalg import cg
+from jax.experimental.sparse import BCOO
+from jax.experimental.sparse import bcoo_dot_general
 
 
 def solve_linear(A, b):
-    return sp.linalg.spsolve(A, b)
+    return jax.experimental.sparse.linalg.spsolve(A, b)
 
 
-def make_A(eps, mu, dx, dy, Nx, Ny, omega, pml_thickness=40, sigma_max=2, m=3):
-    # define the 1d profiles for the pml first
-    sigma_x_1d = np.zeros(Nx)
-    sigma_x_1d[0:pml_thickness] = (
-        sigma_max * (np.flip(np.arange(pml_thickness), axis=0) / (pml_thickness)) ** m
+def _diags(diagonals, offsets, shape) -> jsparse.BCOO:
+    """
+    Build a sparse BCOO matrix of given shape whose k-th diagonal
+    (offset by offsets[k]) is filled from diagonals[k],
+    without ever allocating a full dense matrix.
+    """
+    n_rows, n_cols = shape
+    coord_list = []
+    data_list = []
+
+    for diag, k in zip(diagonals, offsets):
+        # Compute where the diagonal actually lives in the matrix
+        start_row = max(0, -k)
+        start_col = max(0, k)
+        # Maximum length before hitting any boundary
+        length = min(diag.shape[0], n_rows - start_row, n_cols - start_col)
+        if length <= 0:
+            continue
+
+        idxs = jnp.arange(length)
+        rows = start_row + idxs
+        cols = start_col + idxs
+
+        coord_list.append(jnp.stack([rows, cols], axis=1))
+        data_list.append(diag[:length])
+
+    # If we got no valid diagonals, return an all-zero sparse
+    if not coord_list:
+        empty_coords = jnp.zeros((0, 2), dtype=jnp.int32)
+        empty_data = jnp.zeros((0,), dtype=diagonals[0].dtype)
+        return jsparse.BCOO((empty_data, empty_coords), shape=shape)
+
+    # Concatenate all the per-diagonal coords & data
+    coords = jnp.concatenate(coord_list, axis=0)
+    data = jnp.concatenate(data_list, axis=0)
+
+    return jsparse.BCOO((data, coords), shape=shape)
+
+
+def _kron(A: jsparse.BCOO, B: jsparse.BCOO) -> jsparse.BCOO:
+    # Build coordinates for the Kronecker product (A ⊗ B)
+    a_r, a_c = A.indices.T
+    b_r, b_c = B.indices.T
+    rows = (a_r[:, None] * B.shape[0] + b_r[None, :]).ravel()
+    cols = (a_c[:, None] * B.shape[1] + b_c[None, :]).ravel()
+    data = (A.data[:, None] * B.data[None, :]).ravel()
+    idx = jnp.column_stack([rows, cols])
+    shape = (A.shape[0] * B.shape[0], A.shape[1] * B.shape[1])
+    return jsparse.BCOO((data, idx), shape=shape)
+
+
+def _matmul(A: jsparse.BCOO, B: jsparse.BCOO, block_size: int = 1024) -> jsparse.BCOO:
+    """
+    Memory-efficient sparse matrix multiplication for BCOO matrices by processing A in row blocks.
+
+    Args:
+      A: A BCOO sparse matrix of shape (M, K).
+      B: A BCOO sparse matrix of shape (K, N).
+      block_size: Number of rows of A to process at a time to bound memory usage.
+
+    Returns:
+      A new BCOO sparse matrix of shape (M, N) representing A @ B without densifying the full result.
+    """
+    M, K = A.shape
+    _, N = B.shape
+    dimension_numbers = (((1,), (0,)), ((), ()))
+
+    idx_list = []
+    data_list = []
+
+    # Process A in row-wise blocks to cap intermediate memory usage
+    for row_start in range(0, M, block_size):
+        row_end = min(M, row_start + block_size)
+
+        # Mask indices/data belonging to this row block
+        mask = (A.indices[:, 0] >= row_start) & (A.indices[:, 0] < row_end)
+        if not jnp.any(mask):
+            continue
+
+        # Extract block and rebase row indices to [0, block_size)
+        block_indices = A.indices[mask]
+        block_indices = block_indices.at[:, 0].add(-row_start)
+        block_data = A.data[mask]
+        A_block = jsparse.BCOO(
+            (block_indices, block_data), shape=(row_end - row_start, K)
+        )
+
+        # Multiply block x B
+        C_block = bcoo_dot_general(A_block, B, dimension_numbers=dimension_numbers)
+
+        # Rebase block row indices back to global coordinates
+        global_idx = C_block.indices.at[:, 0].add(row_start)
+        idx_list.append(global_idx)
+        data_list.append(C_block.data)
+
+    if not idx_list:
+        # No nonzeros
+        return jsparse.BCOO.fromdense(jnp.zeros((M, N)))
+
+    # Concatenate blocks
+    all_indices = jnp.concatenate(idx_list, axis=0)
+    all_data = jnp.concatenate(data_list, axis=0)
+
+    # Note: Rows are partitioned, so no duplicate (i,j) across blocks. No need to sum.
+    return jsparse.BCOO((all_indices, all_data), shape=(M, N))
+
+
+def make_A(
+    eps: jnp.ndarray,
+    mu: jnp.ndarray,
+    dx: float,
+    dy: float,
+    Nx: int,
+    Ny: int,
+    omega: float,
+    pml_thickness: int = 40,
+    sigma_max: float = 2.0,
+    m: int = 3,
+):
+    """
+    One-to-one JAX re-implementation of make_A, with memory-efficient
+    sparse row-scaling instead of building full diagonal stretching matrices.
+    All inputs have the same meaning as in the original SciPy version.
+    Returns a sparse JAX matrix (BCOO) whose dense form equals the original `A`.
+    """
+    print("Starting make_A...")
+
+    # -------------------------
+    # 1) Build 1-D PML profiles
+    # -------------------------
+    print("Building 1D PML profiles...")
+    idx = jnp.arange(pml_thickness)
+    power = (idx / pml_thickness) ** m
+
+    sigma_x_1d = jnp.zeros(Nx)
+    sigma_x_1d = sigma_x_1d.at[:pml_thickness].set(sigma_max * power[::-1])
+    sigma_x_1d = sigma_x_1d.at[Nx - pml_thickness :].set(sigma_max * power)
+
+    sigma_y_1d = jnp.zeros(Ny)
+    sigma_y_1d = sigma_y_1d.at[:pml_thickness].set(sigma_max * power[::-1])
+    sigma_y_1d = sigma_y_1d.at[Ny - pml_thickness :].set(sigma_max * power)
+
+    # ------------------------
+    # 2) Lift to 2-D and build
+    #    complex stretching
+    # ------------------------
+    print("Building 2D complex stretching...")
+    sigma_x_2d = jnp.tile(sigma_x_1d[None, :], (Ny, 1))
+    sigma_y_2d = jnp.tile(sigma_y_1d[:, None], (1, Nx))
+
+    eps0 = 8.85418e-12
+    s_x = 1.0 + 1j * sigma_x_2d / (omega * eps0)
+    s_y = 1.0 + 1j * sigma_y_2d / (omega * eps0)
+
+    # ---------------------------------
+    # 3) Finite-difference curl blocks
+    # ---------------------------------
+    print("Building finite-difference curl blocks...")
+    Dx = _diags(
+        [-jnp.ones(Nx), jnp.ones(Nx)], offsets=jnp.array([-1, 1]), shape=(Nx, Nx)
+    ) / (2.0 * dx)
+    Dy = _diags(
+        [-jnp.ones(Ny), jnp.ones(Ny)], offsets=jnp.array([-1, 1]), shape=(Ny, Ny)
+    ) / (2.0 * dy)
+
+    I_Nx = _diags([jnp.ones(Nx)], offsets=jnp.array([0]), shape=(Nx, Nx))
+    I_Ny = _diags([jnp.ones(Ny)], offsets=jnp.array([0]), shape=(Ny, Ny))
+
+    print("Computing Kronecker products...")
+    C_x = _kron(I_Ny, Dx)
+    C_y = _kron(Dy, I_Nx)
+
+    # -----------------------------------
+    # 4) Apply complex stretching scales
+    # -----------------------------------
+    print("Applying complex stretching scales (sparse row-scaling)...")
+    N = Nx * Ny
+
+    # Flatten and invert stretch factors
+    sx_flat = s_x.ravel()
+    sy_flat = s_y.ravel()
+    sx_inv = 1.0 / sx_flat
+    sy_inv = 1.0 / sy_flat
+
+    # Row-scale C_x
+    rows_cx = C_x.indices[:, 0]
+    data_cx = C_x.data * sx_inv[rows_cx]
+    C_x = BCOO((data_cx, C_x.indices), shape=(N, N))
+
+    # Row-scale C_y
+    rows_cy = C_y.indices[:, 0]
+    data_cy = C_y.data * sy_inv[rows_cy]
+    C_y = BCOO((data_cy, C_y.indices), shape=(N, N))
+
+    # ----------------------
+    # 5) Material matrices
+    # ----------------------
+    print("Building material matrices...")
+    M_eps = _diags([eps.ravel()], offsets=jnp.array([0]), shape=(N, N))
+    M_mu_inv = _diags([1.0 / mu.ravel()], offsets=jnp.array([0]), shape=(N, N))
+
+    # -------------------------------
+    # 6) Assemble the Helmholtz block
+    # -------------------------------
+    print("Assembling final Helmholtz block...")
+    A = (
+        _matmul(C_x, _matmul(M_mu_inv, C_x.T))
+        + _matmul(C_y, _matmul(M_mu_inv, C_y.T))
+        - (omega**2) * M_eps
     )
-    sigma_x_1d[Nx - pml_thickness :] = (
-        sigma_max * (np.arange(pml_thickness) / (pml_thickness)) ** m
-    )
-
-    sigma_y_1d = np.zeros(Ny)
-    sigma_y_1d[0:pml_thickness] = (
-        sigma_max * (np.flip(np.arange(pml_thickness), axis=0) / (pml_thickness)) ** m
-    )
-    sigma_y_1d[Ny - pml_thickness :] = (
-        sigma_max * (np.arange(pml_thickness) / (pml_thickness)) ** m
-    )
-
-    # lift to 2d
-    sigma_x_2d_extrapolated = np.tile(sigma_x_1d[None, :], (Ny, 1))
-    sigma_y_2d_extrapolated = np.tile(sigma_y_1d[:, None], (1, Nx))
-
-    # form stretching array
-    s_x = 1 + 1j * sigma_x_2d_extrapolated / (omega * 8.85418e-12)
-    s_y = 1 + 1j * sigma_y_2d_extrapolated / (omega * 8.85418e-12)
-
-    # Construct Dx array
-    Dx = sp.diags([-1, 1], [-1, 1], shape=(Nx, Nx)) / (2 * dx)
-    Dy = sp.diags([-1, 1], [-1, 1], shape=(Ny, Ny)) / (2 * dy)
-
-    I_N_x = sp.eye(Nx)
-    I_N_y = sp.eye(Ny)
-
-    C_x = sp.kron(I_N_y, Dx)
-    C_y = sp.kron(Dy, I_N_x)
-
-    C_x = sp.diags(1 / s_x.flatten(), 0, shape=(Nx * Ny, Nx * Ny)) @ C_x
-    C_y = sp.diags(1 / s_y.flatten(), 0, shape=(Nx * Ny, Nx * Ny)) @ C_y
-
-    eps_flat = eps.flatten()
-    mu_flat = mu.flatten()
-
-    M_eps = sp.diags(eps_flat, 0, shape=(Nx * Ny, Nx * Ny))
-    M_mu = sp.diags(1 / mu_flat, 0, shape=(Nx * Ny, Nx * Ny))
-
-    A = C_x @ M_mu @ C_x.T + C_y @ M_mu @ C_y.T - omega**2 * M_eps
-
+    print("make_A complete!")
     return A
+
+
+def apply_A(v_flat):
+    v = v_flat.reshape(Ny, Nx)
+    dμ = 1.0 / mu
+    term = (jnp.diff(v, 1, 1, append=0) / dx - jnp.diff(v, 1, 0, append=0) / dy) * dμ
+    out = (
+        jnp.diff(term, 1, 1, prepend=0) / dx
+        + jnp.diff(term, 1, 0, prepend=0) / dy
+        - (omega**2) * eps * v
+    )
+    return out.ravel()
 
 
 def plot_nonzero(A):
@@ -84,216 +267,6 @@ def plot_nonzero(A):
     plt.close()
 
 
-def _extract_dirichlet_bc(sol_patch: np.ndarray, halo: int):
-    """Return (top, bottom, left, right) field arrays from the outermost ring."""
-    top = sol_patch[halo, halo:-halo].copy()
-    bottom = sol_patch[-halo - 1, halo:-halo].copy()
-    left = sol_patch[halo:-halo, halo].copy()
-    right = sol_patch[halo:-halo, -halo - 1].copy()
-    return top, bottom, left, right
-
-
-def _solve_patch(
-    eps,
-    mu,
-    dx,
-    dy,
-    omega,
-    source,
-    *,
-    pml_thickness: int = 5,
-    dirichlet_bc=None,  # NEW – pass (top, bottom, left, right) or None
-):
-    """
-    Direct FDFD solve on one patch *including* its local PML.
-
-    Parameters
-    ----------
-    dirichlet_bc : None | tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]
-        Fixed Ez values on the outermost cell ring (top, bottom, left, right).
-        Each array is 1-D and already matches the length of that edge.
-        If None (default) no extra Dirichlet rows are imposed.
-    """
-    # ------------------------------------------------------------------
-    # 0. basic checks
-    # ------------------------------------------------------------------
-    assert eps.shape == mu.shape == source.shape, "shape mismatch"
-    Nx, Ny = eps.shape
-    halo = pml_thickness
-
-    # ------------------------------------------------------------------
-    # 1. Assemble the standard Helmholtz matrix for this patch
-    # ------------------------------------------------------------------
-    A = make_A(
-        eps,
-        mu,
-        dx,
-        dy,
-        Nx,
-        Ny,
-        omega,
-        pml_thickness=pml_thickness,
-    )
-    b = (-1j * omega * source).ravel()  # column vector
-
-    # ------------------------------------------------------------------
-    # 2. Impose Dirichlet rows if requested
-    # ------------------------------------------------------------------
-    if dirichlet_bc is not None:
-        top, bottom, left, right = dirichlet_bc
-        A = A.tolil()  # easier to edit rows
-        idx = lambda i, j: i * Ny + j  # 2-D → 1-D mapping
-
-        # --- top edge (y = halo) ---
-        i = halo
-        for j, val in zip(range(halo, Ny - halo), top):
-            k = idx(i, j)
-            A.rows[k] = [k]
-            A.data[k] = [1.0]
-            b[k] = val
-
-        # --- bottom edge (y = Ny-halo-1) ---
-        i = Nx - halo - 1
-        for j, val in zip(range(halo, Ny - halo), bottom):
-            k = idx(i, j)
-            A.rows[k] = [k]
-            A.data[k] = [1.0]
-            b[k] = val
-
-        # --- left edge (x = halo) ---
-        j = halo
-        for i, val in zip(range(halo, Nx - halo), left):
-            k = idx(i, j)
-            A.rows[k] = [k]
-            A.data[k] = [1.0]
-            b[k] = val
-
-        # --- right edge (x = Ny-halo-1) ---
-        j = Ny - halo - 1
-        for i, val in zip(range(halo, Nx - halo), right):
-            k = idx(i, j)
-            A.rows[k] = [k]
-            A.data[k] = [1.0]
-            b[k] = val
-
-        A = A.tocsc()  # back to efficient format
-
-    # ------------------------------------------------------------------
-    # 3. Direct solve
-    # ------------------------------------------------------------------
-    Ez = scipy.sparse.linalg.spsolve(A, b).reshape(eps.shape)
-    return Ez
-
-
-Patch = namedtuple("Patch", ["top_left", "bottom_right"])
-
-
-def run_fdfd(
-    eps,
-    mu,
-    dx,
-    dy,
-    omega,
-    source,
-    *,
-    patch_size: int = 100,
-    padding: int = 30,
-    pml_thickness: int = 10,  # ↑ a bit thicker for better BCs
-):
-    """
-    One-pass tiled FDFD solve with correct RHS and Dirichlet halo exchange.
-    Everything else (patch layout, ordering) matches your original draft.
-    """
-    Nx, Ny = eps.shape
-    assert eps.shape == mu.shape == source.shape, "shape mismatch"
-
-    halo = pml_thickness
-    inner = slice(halo, -halo or None)  # interior slice within a patch
-    orig_source = source.copy()  # fixed RHS
-    solution = np.zeros_like(source)  # start from zero field
-
-    # ------------------------------------------------------------------
-    # 1. Generate patches exactly as before
-    # ------------------------------------------------------------------
-    x_centers = range(patch_size // 2, Nx, patch_size)
-    y_centers = range(patch_size // 2, Ny, patch_size)
-
-    patches = []
-    for cx in x_centers:
-        for cy in y_centers:
-            x_min = max(0, cx - patch_size // 2 - padding)
-            x_max = min(Nx, cx + patch_size // 2 + padding)
-            y_min = max(0, cy - patch_size // 2 - padding)
-            y_max = min(Ny, cy + patch_size // 2 + padding)
-
-            if (x_max - x_min) <= 2 * halo or (y_max - y_min) <= 2 * halo:
-                continue
-            patches.append(((x_min, y_min), (x_max, y_max)))
-
-    # ------------------------------------------------------------------
-    # 2. Distance-sort outward from any patch whose *interior* touches RHS
-    # ------------------------------------------------------------------
-    source_bool = orig_source != 0
-    patches_with_dist, frontier, visited = [], set(), set()
-
-    for idx, patch in enumerate(patches):
-        (a0, b0), (a1, b1) = patch
-        if np.any(source_bool[a0 + halo : a1 - halo, b0 + halo : b1 - halo]):
-            patches_with_dist.append((patch, 0))
-            frontier.add(idx)
-            visited.add(idx)
-
-    d = 0
-    while frontier and len(visited) < len(patches):
-        d += 1
-        nxt = set()
-        for i in frontier:
-            (x0, y0), (x1, y1) = patches[i]
-            for j, p2 in enumerate(patches):
-                if j in visited:  # already labelled
-                    continue
-                (u0, v0), (u1, v1) = p2
-                if x0 <= u1 and u0 <= x1 and y0 <= v1 and v0 <= y1:
-                    visited.add(j)
-                    nxt.add(j)
-                    patches_with_dist.append((p2, d))
-        frontier = nxt
-
-    patches_with_dist.sort(key=lambda t: t[1])  # ensure outward order
-
-    # ------------------------------------------------------------------
-    # 3. Single outward sweep
-    # ------------------------------------------------------------------
-    for patch, _dist in patches_with_dist:
-        (x0, y0), (x1, y1) = patch
-
-        # materials & RHS
-        p_eps = eps[x0:x1, y0:y1]
-        p_mu = mu[x0:x1, y0:y1]
-        p_source = orig_source[x0:x1, y0:y1]
-
-        # current global field over the patch → Dirichlet ring
-        sol_patch = solution[x0:x1, y0:y1]
-        bc = _extract_dirichlet_bc(sol_patch, halo)
-
-        # local solve (needs new kw-arg)
-        p_sol = _solve_patch(
-            p_eps,
-            p_mu,
-            dx,
-            dy,
-            omega,
-            p_source,
-            pml_thickness=halo,
-            dirichlet_bc=bc,  # ← NEW
-        )
-
-        # overwrite interior (no relaxation)
-        solution[x0 + halo : x1 - halo, y0 + halo : y1 - halo] = p_sol[inner, inner]
-
-    return solution
-
-
 if __name__ == "__main__":
     Nx = 1000
     Ny = 1000
@@ -302,11 +275,12 @@ if __name__ == "__main__":
 
     source = np.zeros((Nx, Ny))
     source[197:199, 190] = 10
+    source = jnp.array(source)
 
-    eps, mu = material_init("example_structure.png", Nx, Ny, 3)
+    eps, mu = material_init("assets/example_structure.png", Nx, Ny, 3)
 
-    c_medium = 1 / np.sqrt(eps * mu)
-    c_min = np.min(c_medium)
+    c_medium = 1 / jnp.sqrt(eps * mu)
+    c_min = jnp.min(c_medium)
     lambda_min = c_min / omega
 
     # resolution check
@@ -320,29 +294,21 @@ if __name__ == "__main__":
     if dx < lambda_min / 20:
         raise ValueError("dx too small, you're throwing away compute")
 
+    print("starting make A")
+
     A = make_A(eps, mu, dx, dy, Nx, Ny, omega)
     b = -1j * omega * source.flatten()
 
-    # Plot the top left corner of the matrix A
-    # plt.figure(figsize=(10, 10))
-    # A_dense = A[:100, :100].toarray()  # Convert top-left corner to dense array
-    # plt.imshow(A_dense != 0, cmap="RdBu")  # Red for nonzero, blue for zero
-    # plt.colorbar()
-    # plt.title("Sparsity pattern of top-left corner of matrix A")
-    # plt.savefig("matrix_pattern.png")
-    # plt.close()
-    # print(b.shape)
-    # graph = sp.csgraph.reverse_cuthill_mckee(A, symmetric_mode=True)
-    # permuted_A = A[graph, :][:, graph]
-    # print(sp.linalg.spbandwidth(A))
-    # print(sp.linalg.spbandwidth(permuted_A))
+    print("finished making A")
 
-    Ez_new = run_fdfd(eps, mu, dx, dy, omega, source)
+    b = jnp.array(b)
+    Ez_new = solve_linear(A, b)
+    Ez_new = Ez_new.reshape(Ny, Nx)
     plot_Ez(
         Ez_new,
         eps,
         source,
         "Ez_tiled.png",
-        np.max(np.abs(Ez_new)),
-        -np.max(np.abs(Ez_new)),
+        jnp.max(jnp.abs(Ez_new)),
+        -jnp.max(jnp.abs(Ez_new)),
     )
