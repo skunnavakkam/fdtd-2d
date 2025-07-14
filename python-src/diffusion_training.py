@@ -289,13 +289,10 @@ def plot_noisy_sample(noisy_sample: torch.Tensor):
 
 if __name__ == "__main__":
     eps_samples, mu_samples, src_samples, omega_samples, Ez_samples = generate_data(
-        10, (250, 250)
+        1000, (250, 250)
     )
     print(Ez_samples.shape)
     noisy_samples, alphas_cumprod = generate_diffusion_data(Ez_samples, 8)
 
     print(noisy_samples.shape)
     print(alphas_cumprod.shape)
-
-    for sample in noisy_samples:
-        plot_noisy_sample(sample)

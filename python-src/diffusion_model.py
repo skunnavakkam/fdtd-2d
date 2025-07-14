@@ -1,10 +1,34 @@
+import math
 import torch
 from torch import nn
+
+
+class SinusoidalPosEmb(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, x):
+        device = x.device
+        half_dim = self.dim // 2
+        emb = math.log(10000) / (half_dim - 1)
+        emb = torch.exp(torch.arange(half_dim, device=device) * -emb)
+        emb = x[:, None] * emb[None, :]
+        emb = torch.cat([emb.sin(), emb.cos()], dim=-1)
+        return emb
 
 
 class UNet2DModel(nn.Module):
     def __init__(self):
         super().__init__()
+        # Timestep embedding dimension matches bottleneck channels
+        self.time_embed_dim = 512
+        self.time_embedding = SinusoidalPosEmb(self.time_embed_dim)
+        self.time_mlp = nn.Sequential(
+            nn.Linear(self.time_embed_dim, self.time_embed_dim),
+            nn.ReLU(),
+            nn.Linear(self.time_embed_dim, self.time_embed_dim),
+        )
 
         # Encoder blocks - takes in 4 channels (eps, mu, src, diffusion)
         self.enc1 = nn.Sequential(
@@ -81,7 +105,7 @@ class UNet2DModel(nn.Module):
         # Output single channel for diffusion image
         self.final = nn.Conv2d(64, 1, 1)
 
-    def forward(self, eps, mu, src, diffusion):
+    def forward(self, eps, mu, src, diffusion, t, omega):
         # Combine inputs into 4 channels
         x = torch.cat([eps, mu, src, diffusion], dim=1)
 
@@ -98,6 +122,11 @@ class UNet2DModel(nn.Module):
         # Bottleneck
         bottleneck = self.bottleneck(pool3)
 
+        # Timestep embedding
+        t_emb = self.time_embedding(t)  # (batch, time_embed_dim)
+        t_emb = self.time_mlp(t_emb)  # (batch, time_embed_dim)
+        bottleneck = bottleneck + t_emb[:, :, None, None]
+
         # Decoder
         up3 = self.upconv3(bottleneck)
         dec3 = self.dec3(torch.cat([up3, enc3], dim=1))
@@ -109,4 +138,7 @@ class UNet2DModel(nn.Module):
         dec1 = self.dec1(torch.cat([up1, enc1], dim=1))
 
         # Output diffusion image
-        return self.final(dec1)
+        out = self.final(dec1)
+
+        # Omega is accepted as an input but not used internally
+        return out
