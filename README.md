@@ -104,4 +104,11 @@ The uniqueness and existence theorem gives that the boundary conditions of a sys
 
 The image above shows the distance of each patch from the source patch (marked with a red star). The colors indicate how many patches away from the source each patch is, with lighter colors being further. What happens if we solve for the solution in each patch, enforce some dirichelet boundary conditions at each point, and then use the solution in the patches to solve for the solution in the next patch?
 
-Some basic math shows that this solution happens in $O(n^2)$ time, which is a little too good to be true, and this is evidence by the solution not working perfectly. I think this probably ends up being a good approximation for a solution after a long but not infinite time, and I think that with a little bit more work this can serve as adequate preconditioning for a matrix solve, or this can work in a similar iterative fashion to an iterative matrix solver. Some hints that this might work are that you see coupling to the ring resonator.
+Some basic math shows that this solution happens in $O(n^2)$ time, which is a little too good to be true, and this is evidence by the solution not working perfectly. I think this probably ends up being a good approximation for a solution after a long but not infinite time, and I think that with a little bit more work this can serve as adequate preconditioning for a matrix solve, or this can work in a similar iterative fashion to an iterative matrix solver. Some hints that this might work are that you see coupling to the ring resonator (look at the bottom right quadrant).
+
+![Tiled FDFD](assets/Ez_tiled.png)
+
+My implementation of this is about 5-7x faster than the native sparse solve, since I tile $100 \times 100$-sized patches patches with overlap of $20$ pixels, leading to sparse solving a $120 \times 120$ matrix $100$ times. This takes about 3 seconds. The direct sparse solve of $1000 \times 1000$ matrix takes about 20 seconds.
+
+Pulling a number out of my ass, I think that the ideal solution happens in about $O(n^2 \log n)$ time. My justification of this is solving the patches takes $O(n^2)$ time, and there would be $\log n$ iteration steps if each iteration step was a constant multiple better (for example, if we needed $10^-2$ tolerance, and each iteration step was $10$x betterm then there would be $\log_{10} (100) = 2$ iteration steps)..
+
