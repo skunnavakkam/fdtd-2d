@@ -7,6 +7,7 @@ import matplotlib.pyplot as plt
 import torch.nn.functional as F
 from tqdm import trange
 from diffusion_model import UNet2DModel
+from torch.utils.data import TensorDataset, DataLoader
 
 """
 This is inspired by DiffusionPDE. We solve FDFD and use that for denoising diffusion training.
@@ -42,7 +43,7 @@ def run_fdfd(eps: torch.Tensor, mu: torch.Tensor, source: torch.Tensor, dx, omeg
 def generate_random_permittivity(
     dimension: Tuple[int, int],
     device: torch.device = torch.device("cpu"),
-    dtype: torch.dtype = torch.float64,
+    dtype: torch.dtype = torch.float32,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Generate a permittivity field (ε) with diverse patterns including:
@@ -82,7 +83,7 @@ def generate_random_permittivity(
 
 
 def generate_random_source(
-    dimension: Tuple[int, int], dtype=torch.float64, device=torch.device("cpu")
+    dimension: Tuple[int, int], dtype=torch.float32, device=torch.device("cpu")
 ) -> torch.Tensor:
     """
     Generate a random source configuration with either line or point sources.
@@ -158,7 +159,7 @@ def generate_data(num_samples: int, dimension: Tuple[int, int]):
         src = generate_random_source(dimension)
 
         # Generate random frequency between 9-30 GHz
-        omega = torch.rand(1).item() * (30e9 - 18e9) + 18e9
+        omega = torch.rand(1, dtype=torch.float32).item() * (30e9 - 18e9) + 18e9
 
         Ez = run_fdfd(eps, mu, src, 1e-3, omega)
 
@@ -172,7 +173,7 @@ def generate_data(num_samples: int, dimension: Tuple[int, int]):
         torch.stack(eps_samples),
         torch.stack(mu_samples),
         torch.stack(src_samples),
-        torch.tensor(omega_samples),
+        torch.tensor(omega_samples, dtype=torch.float32),
         torch.stack(Ez_samples),
     )
 
@@ -236,10 +237,10 @@ def generate_diffusion_data(
     # 1) build raw α on [0,1]
     if schedule == "cosine":
         s = 0.5
-        t_lin = torch.linspace(0, 1, num_steps, device=device)
+        t_lin = torch.linspace(0, 1, num_steps, device=device, dtype=torch.float32)
         raw = torch.cos(((t_lin + s) / (1 + s)) * (torch.pi / 2)).pow(2)
     elif schedule == "linear":
-        betas = torch.linspace(0.0, 0.01, num_steps, device=device)
+        betas = torch.linspace(0.0, 0.01, num_steps, device=device, dtype=torch.float32)
         raw = torch.cumprod(1 - betas, dim=0)
     else:
         raise ValueError(f"Unknown schedule {schedule!r}")
@@ -247,14 +248,14 @@ def generate_diffusion_data(
     alphas = raw
 
     # 3) diffusion loop with scalar αₜ
-    noisy = torch.zeros((B, num_steps, H, W), device=device)
+    noisy = torch.zeros((B, num_steps, H, W), device=device, dtype=torch.float32)
     for t in range(num_steps):
         if t == 0:
             noisy[:, t] = Ez
         else:
             α_t = alphas[t]  # zero‐dim tensor
             print(α_t.shape)
-            noise = noise_scale * torch.randn_like(Ez) + noise_mean
+            noise = noise_scale * torch.randn_like(Ez, dtype=torch.float32) + noise_mean
             noisy[:, t] = α_t.sqrt() * Ez + (1 - α_t).sqrt() * noise
 
     # drop batch dim if input was 2D
@@ -287,12 +288,95 @@ def plot_noisy_sample(noisy_sample: torch.Tensor):
     plt.show()
 
 
-if __name__ == "__main__":
-    eps_samples, mu_samples, src_samples, omega_samples, Ez_samples = generate_data(
-        1000, (250, 250)
-    )
-    print(Ez_samples.shape)
-    noisy_samples, alphas_cumprod = generate_diffusion_data(Ez_samples, 8)
+def train_model(model, optimizer, dataloader, num_steps, num_epochs, device):
+    """
+    Training loop for the diffusion-based PDE solver.
+    Args:
+        model:          UNet2DModel instance
+        optimizer:      torch optimizer
+        dataloader:     DataLoader yielding (eps, mu, src, Ez, omega)
+        num_steps:      Number of diffusion timesteps
+        num_epochs:     Number of epochs to train
+        device:         torch device
+    """
+    criterion = torch.nn.MSELoss()
+    model.train()
 
-    print(noisy_samples.shape)
-    print(alphas_cumprod.shape)
+    for epoch in range(1, num_epochs + 1):
+        total_loss = 0.0
+        for eps, mu, src, Ez, omega in dataloader:
+            # Move tensors to device
+            eps = eps.to(device).to(torch.float32)
+            mu = mu.to(device).to(torch.float32)
+            src = src.to(device).to(torch.float32)
+            Ez = Ez.to(device).to(torch.float32)
+            omega = omega.to(device).to(torch.float32)
+
+            # Generate diffusion trajectory for clean Ez
+            noisy_traj, alphas = generate_diffusion_data(Ez, num_steps, device=device)
+
+            # Batch size and device info
+            if noisy_traj.ndim == 4:
+                B = noisy_traj.shape[0]
+            else:
+                noisy_traj = noisy_traj.unsqueeze(0)
+                B = 1
+
+            # Sample random timesteps t for each sample
+            t = torch.randint(0, num_steps, (B,), device=device)
+
+            # Extract noisy input at sampled t
+            x_t = noisy_traj[torch.arange(B), t]  # [B, H, W]
+            diffusion = x_t.unsqueeze(1)  # add channel dim -> [B, 1, H, W]
+
+            # Forward pass: model expects eps, mu, src, diffusion, t, omega
+            pred = model(
+                eps.unsqueeze(1),  # [B,1,H,W]
+                mu.unsqueeze(1),  # [B,1,H,W]
+                src.unsqueeze(1),  # [B,1,H,W]
+                diffusion,  # [B,1,H,W]
+                t.float(),  # [B]
+                omega,  # [B]
+            )  # returns [B,1,H,W]
+
+            # Compute loss: predict clean Ez
+            target = Ez.unsqueeze(1)  # [B,1,H,W]
+            loss = criterion(pred, target)
+
+            # Backprop
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            total_loss += loss.item()
+
+        avg_loss = total_loss / len(dataloader)
+        print(f"Epoch {epoch}/{num_epochs} — Loss: {avg_loss:.6f}")
+
+
+if __name__ == "__main__":
+    # Hyperparameters
+    num_samples = 1000
+    dimension = (250, 250)
+    num_steps = 8
+    num_epochs = 20
+    batch_size = 16
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Generate dataset: returns eps, mu, src, omega, Ez
+    eps_samples, mu_samples, src_samples, omega_samples, Ez_samples = generate_data(
+        num_samples, dimension
+    )
+
+    # Create a DataLoader: (eps, mu, src, Ez, omega)
+    dataset = TensorDataset(
+        eps_samples, mu_samples, src_samples, Ez_samples, omega_samples
+    )
+    train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
+    # Initialize model and optimizer
+    model = UNet2DModel().to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+    # Begin training
+    train_model(model, optimizer, train_loader, num_steps, num_epochs, device)

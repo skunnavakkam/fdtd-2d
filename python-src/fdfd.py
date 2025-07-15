@@ -82,21 +82,21 @@ def plot_nonzero(A):
 
 
 if __name__ == "__main__":
-    Nx = 60
-    Ny = 60
+    Nx = 1000
+    Ny = 1000
     dx = dy = 1e-3
     omega = 17e9
 
     source = np.zeros((Nx, Ny))
-    source = np.array(source)
+    source[200, 200] = 10
 
     eps, mu = material_init("assets/example_structure.png", Nx, Ny, 3)
-
     c_medium = 1 / np.sqrt(eps * mu)
     c_min = np.min(c_medium)
     lambda_min = c_min / omega
 
     # resolution check
+
     if dx > lambda_min / 10:
         raise ValueError(
             "dx must be less than lambda_min / 10, current dx: {}, lambda_min / 10: {}".format(
@@ -107,6 +107,11 @@ if __name__ == "__main__":
     if dx < lambda_min / 20:
         raise ValueError("dx too small, you're throwing away compute")
 
-    print("starting FDFD")
+    A = make_A(eps, mu, dx, dy, Nx, Ny, omega)
+    b = omega * source.flatten()
 
-    A_jax, A_jax_scipy = make_A_scipy_jax(eps, mu, dx, dy, Nx, Ny, omega)
+    Ez_new = solve_linear(A, b)
+
+    Ez = np.real(Ez_new.reshape(Nx, Ny))
+
+    plot_Ez(Ez, eps, source, "Ez.png", np.max(np.abs(Ez)), -np.max(np.abs(Ez)))

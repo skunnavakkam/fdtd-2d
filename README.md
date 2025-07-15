@@ -20,13 +20,13 @@ However, getting from these equations to a simulation is not straightforward, an
 
 We can pick two polarizations of light in 2D, one where the electric field is perpendicular to the plane of the paper, and one where the electric field is in the plane of the paper. These are the TE and TM modes respectively. In the TE mode, the electric field only contains a $z$ component, and the change in the $z$ component $\frac{\partial E_z}{\partial t}$ is 0. In this case, we can expand the curl operator to be
 
-$
+$$
 \nabla \times \mathbf{E} = \begin{vmatrix}
 \mathbf{i} & \mathbf{j} & \mathbf{k} \\
 \frac{\partial}{\partial x} & \frac{\partial}{\partial y} & \frac{\partial}{\partial z} \\
 E_x & E_y & E_z
 \end{vmatrix}
-$
+$$
 
 ## FDTD
 
@@ -34,13 +34,67 @@ $
 
 FDTD is an extremely good way to solve Maxwell's equations for transient sources, but oftentimes in photonics simulations we are concenred about the state of a system after a very long time passes, or the steady state. Steady state solutions happen rapidly in light-matter simulations due to the high speed of light! The relation between time-domain and frequency-domain signals by the Fourier transform already gives a hint that we can solve for the steady state at a given frequency!
 
-This is a really nice solution, since we often only care about the behavior of light with constant frequency sources such as a red laser!
+This is a really nice solution, since we often only care about the behavior of light with constant frequency sources such as a red laser. 
 
-We can then do this with a single matrix solve of the form $Ax = b$ where $A$ is a sparse matrix representing the discrete difference operator for Curl and $b$ is the source term.
+We can take Maxwell's equations in the frequency domain, which yields 
 
-However, this is a big matrix. The side length of the matrix is $N_x \times N_y$, leading to slow solve times. For a $1000 \times 1000$ grid, this is a $10^6 \times 10^6$ matrix, and the system takes around 13 seconds to solve on my laptop. Can we do better? Maybe we can! I have two proposed solutions:
+$$
+\nabla \times \mathbf{E} = i \omega \mu \mathbf{H} = i \omega \mathbf{B}
+$$
+
+Since we say that $\mathbf{B} = \Re(B_0 e^{i \omega t})$, and from Maxwell's equations we have that $\nabla \times \mathbf{E} = -\frac{\partial \mathbf{B}}{\partial t}$, we can then differentiation $\mathbf{B}$.
+
+$$
+-\frac{\partial \mathbf{B}}{\partial t} = i \omega dot B_0 e^{i \omega t} = i \omega \mathbf{B}
+$$
+
+This equation works with a continuous E-field and B-field, but we can discretize it to get a matrix equation. We can unravel the $E$ and $B$ fields (each initially with discretized shape $N_x, N_y$) into a single vector $\hat{E}$ and $\hat{B}$ with shape $N_x \times N_y$ We can then generate an operator $curl: \mathbb{R}^{N_x \times N_y} \to \mathbb{R}^{N_x \times N_y}$ that takes the curl of the field. Constructing this field is given by the Crank-Nicolson method, but I'll also provide some motivation here with a smaller sample, taking the curl of a $3 \times 3$ grid. 
+
+First, flatten the grid into a vector.
+
+
+![Flattening a 3x3 grid into a vector](assets/flatten.png)
+
+We can then try to compute the curl at $(2, 2)$. We should first the discrete $\frac{\Delta E}{\Delta y}$ and $\frac{\Delta E}{\Delta x}$ at $(2, 2)$.
+
+$$
+\Delta E_x = \frac{E_{2, 3} - E_{2, 1}}{2}`
+$$
+
+$$
+\Delta E_y = \frac{E_{1, 2} - E_{3, 2}}{2}
+$$
+
+We then have that the curl at $(2, 2)$ is
+
+$$
+\nabla \times \mathbf{E} = \frac{\Delta E_x}{\Delta x} - \frac{\Delta E_y}{\Delta y}
+$$
+
+We can then construct a matrix that takes the curl of the field at that point.
+
+![The Constructed Matrix](assets/constructed_matrix.png)
+
+In general, you get a matrix of this form, sometimes called an *outrigger* matrix. 
+
+![The Outrigger Matrix](assets/outrigger.png)
+
+This yields a system of equations
+
+$$
+A \hat{E} = -i \omega \hat{B}
+$$
+
+We can then solve for $\hat{E}$ using a sparse solver. Recall that the matrix has shape $(N_x \times N_y, N_x \times N_y)$, but only has $4$ non-zero entries per row. This is a big matrix, but it is sparse, and it is a banded matrix. 
+
+We solve this system of equations using a sparse solver like `scipy.sparse.linalg.spsolve` and voila! Look at this perfect ring resonator coupling!
+
+![The Ring Resonator](assets/ring_resonator.png)
+
 
 ### Diffusion Modelling
+
+Diffusion models are probably very good at solving these types of problems, and things like `DiffusionPDE` already show some promise! I think diffusion modelling can be thought of as a heuristics-based iterative solver. 
 
 ### Tiled FDFD
 
@@ -48,4 +102,6 @@ The uniqueness and existence theorem gives that the boundary conditions of a sys
 
 ![Patch distances visualization showing how far each patch is from the source](assets/patch_distances.png)
 
-The image above shows the distance of each patch from the source patch (marked with a red star). The colors indicate how many patches away from the source each patch is, with lighter colors being further.
+The image above shows the distance of each patch from the source patch (marked with a red star). The colors indicate how many patches away from the source each patch is, with lighter colors being further. What happens if we solve for the solution in each patch, enforce some dirichelet boundary conditions at each point, and then use the solution in the patches to solve for the solution in the next patch?
+
+Some basic math shows that this solution happens in $O(n^2)$ time, which is a little too good to be true, and this is evidence by the solution not working perfectly. I think this probably ends up being a good approximation for a solution after a long but not infinite time, and I think that with a little bit more work this can serve as adequate preconditioning for a matrix solve, or this can work in a similar iterative fashion to an iterative matrix solver. Some hints that this might work are that you see coupling to the ring resonator.
