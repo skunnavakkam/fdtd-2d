@@ -45,7 +45,7 @@ $$
 Since we say that $\mathbf{B} = \Re(B_0 e^{i \omega t})$, and from Maxwell's equations we have that $\nabla \times \mathbf{E} = -\frac{\partial \mathbf{B}}{\partial t}$, we can then differentiation $\mathbf{B}$.
 
 $$
--\frac{\partial \mathbf{B}}{\partial t} = i \omega dot B_0 e^{i \omega t} = i \omega \mathbf{B}
+-\frac{\partial \mathbf{B}}{\partial t} = i \omega \cdot B_0 e^{i \omega t} = i \omega \mathbf{B}
 $$
 
 This equation works with a continuous E-field and B-field, but we can discretize it to get a matrix equation. We can unravel the $E$ and $B$ fields (each initially with discretized shape $N_x, N_y$) into a single vector $\hat{E}$ and $\hat{B}$ with shape $N_x \times N_y$ We can then generate an operator $curl: \mathbb{R}^{N_x \times N_y} \to \mathbb{R}^{N_x \times N_y}$ that takes the curl of the field. Constructing this field is given by the Crank-Nicolson method, but I'll also provide some motivation here with a smaller sample, taking the curl of a $3 \times 3$ grid. 
