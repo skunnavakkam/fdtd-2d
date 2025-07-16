@@ -1,13 +1,13 @@
 import torch
 from typing import Tuple
 from fdfd import make_A
-import numpy as np
 import scipy.sparse.linalg
 import matplotlib.pyplot as plt
 import torch.nn.functional as F
 from tqdm import trange
-from diffusion_model import UNet2DModel
 from torch.utils.data import TensorDataset, DataLoader
+from torch import nn
+
 
 """
 This is inspired by DiffusionPDE. We solve FDFD and use that for denoising diffusion training.
@@ -20,6 +20,174 @@ We then train a model to predict sol, given z and b.
 
 and z, b given sol. 
 """
+
+
+class SinusoidalPosEmb(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        device = x.device
+        half_dim = self.dim // 2
+        emb = torch.exp(
+            -torch.log(torch.tensor(10000.0, device=device))
+            * torch.arange(half_dim, device=device)
+            / (half_dim - 1)
+        )
+        emb = x[:, None] * emb[None, :]
+        return torch.cat((emb.sin(), emb.cos()), dim=-1)
+
+
+def make_block(in_channels: int, out_channels: int) -> nn.Sequential:
+    return nn.Sequential(
+        nn.Conv2d(in_channels, out_channels, kernel_size=3, padding="same"),
+        nn.BatchNorm2d(out_channels),
+        nn.ReLU(inplace=True),
+        nn.Conv2d(out_channels, out_channels, kernel_size=3, padding="same"),
+        nn.BatchNorm2d(out_channels),
+        nn.ReLU(inplace=True),
+    )
+
+
+class UNet2DModel(nn.Module):
+    def __init__(self, time_embed_dim: int = 512):
+        super().__init__()
+        self.time_embed_dim = time_embed_dim
+        # time embedding
+        self.time_embedding = SinusoidalPosEmb(self.time_embed_dim)
+        self.time_mlp = nn.Sequential(
+            nn.Linear(self.time_embed_dim, self.time_embed_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(self.time_embed_dim, self.time_embed_dim),
+        )
+        # omega embedding (scalar -> vector)
+        self.omega_mlp = nn.Sequential(
+            nn.Linear(1, self.time_embed_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(self.time_embed_dim, self.time_embed_dim),
+        )
+
+        # encoder
+        self.enc1 = make_block(4, 64)
+        self.enc2 = make_block(64, 128)
+        self.enc3 = make_block(128, 256)
+        # bottleneck
+        self.bottleneck = make_block(256, 512)
+        # decoder
+        self.dec3 = make_block(512 + 256, 256)
+        self.dec2 = make_block(256 + 128, 128)
+        self.dec1 = make_block(128 + 64, 64)
+        # final output
+        self.final = nn.Conv2d(64, 1, kernel_size=1)
+
+    def _make_time_emb(
+        self, t: torch.Tensor, spatial_size: Tuple[int, int]
+    ) -> torch.Tensor:
+        t_emb = self.time_embedding(t)
+        t_emb = self.time_mlp(t_emb)
+        B, C = t_emb.shape
+        H, W = spatial_size
+        return t_emb.view(B, C, 1, 1).expand(B, C, H, W)
+
+    def _make_omega_emb(
+        self, omega: torch.Tensor, spatial_size: Tuple[int, int]
+    ) -> torch.Tensor:
+        # omega: [B]
+        omega = omega.unsqueeze(-1)  # [B,1]
+        omega_emb = self.omega_mlp(omega)  # [B, time_embed_dim]
+        B, C = omega_emb.shape
+        H, W = spatial_size
+        return omega_emb.view(B, C, 1, 1).expand(B, C, H, W)
+
+    def forward(
+        self,
+        eps: torch.Tensor,
+        mu: torch.Tensor,
+        src: torch.Tensor,
+        diffusion: torch.Tensor,
+        t: torch.Tensor,
+        omega: torch.Tensor,
+    ) -> torch.Tensor:
+        # concat inputs -> [B,4,H,W]
+        x = torch.cat([eps, mu, src, diffusion], dim=1)
+        # encoder
+        e1 = self.enc1(x)
+        p1 = F.max_pool2d(e1, 2)
+        e2 = self.enc2(p1)
+        p2 = F.max_pool2d(e2, 2)
+        e3 = self.enc3(p2)
+        p3 = F.max_pool2d(e3, 2)
+
+        # bottleneck + time & omega embeddings
+        b = self.bottleneck(p3)
+        b = b + self._make_time_emb(t.float(), p3.shape[-2:])
+        b = b + self._make_omega_emb(omega.float(), p3.shape[-2:])
+
+        # decoder
+        d3 = F.interpolate(b, size=e3.shape[-2:], mode="nearest")
+        d3 = self.dec3(torch.cat([d3, e3], dim=1))
+        d2 = F.interpolate(d3, size=e2.shape[-2:], mode="nearest")
+        d2 = self.dec2(torch.cat([d2, e2], dim=1))
+        d1 = F.interpolate(d2, size=e1.shape[-2:], mode="nearest")
+        d1 = self.dec1(torch.cat([d1, e1], dim=1))
+        return self.final(d1)
+
+
+def do_inference(model, eps, mu, src, omega, device):
+    """
+    Run the full inference pipeline using a correct reverse-diffusion sampler.
+
+    Args:
+        model:     Trained UNet model
+        eps:       Permittivity tensor [H,W]
+        mu:        Permeability tensor [H,W]
+        src:       Source tensor [H,W]
+        omega:     Angular frequency scalar
+        device:    torch.device
+    Returns:
+        Predicted Ez field [H,W]
+    """
+    model.eval()
+
+    # Prepare inputs
+    eps = eps.to(device).unsqueeze(0).unsqueeze(0)  # [1,1,H,W]
+    mu = mu.to(device).unsqueeze(0).unsqueeze(0)  # [1,1,H,W]
+    src = src.to(device).unsqueeze(0).unsqueeze(0)  # [1,1,H,W]
+    omega = torch.tensor([omega], device=device)  # [1]
+
+    B, _, H, W = eps.shape
+    num_steps = 8  # match training schedule
+
+    # Build noise schedule (we only need alphas)
+    _, alphas = generate_diffusion_data(
+        torch.zeros((H, W), device=device), num_steps, device=device
+    )  # returns (noisy, alphas)
+
+    with torch.no_grad():
+        # Initialize with pure noise
+        x_t = torch.randn((B, 1, H, W), device=device)
+
+        # Reverse diffusion: t = T-1 ... 1
+        for t in reversed(range(1, num_steps)):
+            t_tensor = torch.tensor([t], device=device).float()
+
+            # Predict x0
+            x0_pred = model(eps, mu, src, x_t, t_tensor, omega)
+
+            # Sample noise for this step
+            noise = torch.randn_like(x_t)
+
+            # Compute previous alpha
+            alpha_prev = alphas[t - 1]
+
+            # Update x_{t-1}
+            x_t = alpha_prev.sqrt() * x0_pred + (1 - alpha_prev).sqrt() * noise
+
+        # Final step (t=0): directly predict clean field
+        x0 = model(eps, mu, src, x_t, torch.tensor([0], device=device).float(), omega)
+
+    return x0.squeeze()  # [H, W]
 
 
 def run_fdfd(eps: torch.Tensor, mu: torch.Tensor, source: torch.Tensor, dx, omega):
@@ -42,7 +210,7 @@ def run_fdfd(eps: torch.Tensor, mu: torch.Tensor, source: torch.Tensor, dx, omeg
 
 def generate_random_permittivity(
     dimension: Tuple[int, int],
-    device: torch.device = torch.device("cpu"),
+    device: torch.device = torch.device("mps"),
     dtype: torch.dtype = torch.float32,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
@@ -83,7 +251,7 @@ def generate_random_permittivity(
 
 
 def generate_random_source(
-    dimension: Tuple[int, int], dtype=torch.float32, device=torch.device("cpu")
+    dimension: Tuple[int, int], dtype=torch.float32, device=torch.device("mps")
 ) -> torch.Tensor:
     """
     Generate a random source configuration with either line or point sources.
@@ -254,7 +422,6 @@ def generate_diffusion_data(
             noisy[:, t] = Ez
         else:
             α_t = alphas[t]  # zero‐dim tensor
-            print(α_t.shape)
             noise = noise_scale * torch.randn_like(Ez, dtype=torch.float32) + noise_mean
             noisy[:, t] = α_t.sqrt() * Ez + (1 - α_t).sqrt() * noise
 
@@ -288,7 +455,9 @@ def plot_noisy_sample(noisy_sample: torch.Tensor):
     plt.show()
 
 
-def train_model(model, optimizer, dataloader, num_steps, num_epochs, device):
+def train_model(
+    model, optimizer, dataloader, num_steps, num_epochs, device, weight_decay=1e-4
+):
     """
     Training loop for the diffusion-based PDE solver.
     Args:
@@ -301,6 +470,14 @@ def train_model(model, optimizer, dataloader, num_steps, num_epochs, device):
     """
     criterion = torch.nn.MSELoss()
     model.train()
+
+    # Get a sample from dataloader for inference
+    sample_eps, sample_mu, sample_src, sample_Ez, sample_omega = next(iter(dataloader))
+    sample_eps = sample_eps[0].to(device)  # Take first sample
+    sample_mu = sample_mu[0].to(device)
+    sample_src = sample_src[0].to(device)
+    sample_Ez = sample_Ez[0].to(device)
+    sample_omega = sample_omega[0].to(device)
 
     for epoch in range(1, num_epochs + 1):
         total_loss = 0.0
@@ -353,6 +530,41 @@ def train_model(model, optimizer, dataloader, num_steps, num_epochs, device):
         avg_loss = total_loss / len(dataloader)
         print(f"Epoch {epoch}/{num_epochs} — Loss: {avg_loss:.6f}")
 
+        # Run inference after each epoch
+        model.eval()
+        with torch.no_grad():
+            inferred_Ez = do_inference(
+                model, sample_eps, sample_mu, sample_src, sample_omega, device
+            )
+
+            # Calculate reference solution using FDFD
+            reference_Ez = run_fdfd(
+                sample_eps,
+                sample_mu,
+                sample_src,
+                dx=1e-3,
+                omega=sample_omega.item(),
+            )
+
+            # Plot both inference and reference
+            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(20, 10))
+
+            # Plot inference result
+            im1 = ax1.imshow(inferred_Ez.cpu().numpy(), cmap="bwr")
+            ax1.set_title("Model Inference")
+            plt.colorbar(im1, ax=ax1)
+
+            # Plot reference solution
+            im2 = ax2.imshow(reference_Ez.cpu().numpy(), cmap="bwr")
+            ax2.set_title("FDFD Reference")
+            plt.colorbar(im2, ax=ax2)
+
+            plt.suptitle(f"Epoch {epoch}")
+            plt.savefig(f"assets/logs/comparison_epoch_{epoch}.png")
+            plt.close()
+
+        model.train()
+
 
 if __name__ == "__main__":
     # Hyperparameters
@@ -361,12 +573,15 @@ if __name__ == "__main__":
     num_steps = 8
     num_epochs = 20
     batch_size = 16
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("mps")
 
     # Generate dataset: returns eps, mu, src, omega, Ez
     eps_samples, mu_samples, src_samples, omega_samples, Ez_samples = generate_data(
         num_samples, dimension
     )
+
+    noise_sample, alphas = generate_diffusion_data(Ez_samples, num_steps, device=device)
+    plot_noisy_sample(noise_sample[0])
 
     # Create a DataLoader: (eps, mu, src, Ez, omega)
     dataset = TensorDataset(
