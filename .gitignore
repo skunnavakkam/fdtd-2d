@@ -3,3 +3,4 @@ python-src/frames/
 python-src/*.mp4
 __pycache__/
 python-src/assets/
+.venv/
