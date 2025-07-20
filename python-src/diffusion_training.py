@@ -327,7 +327,7 @@ if __name__ == "__main__":
     dataloader = DataLoader(dataset, batch_size=8, shuffle=True)
 
     # Training parameters
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-5)
     num_epochs = 100
 
     # Training loop
