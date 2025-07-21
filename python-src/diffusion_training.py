@@ -244,22 +244,30 @@ def plot_noisy_sample(noisy_sample: torch.Tensor):
 def plot_ref_v_inference(ref, inference, path):
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
 
-    maximum = torch.max(torch.max(torch.abs(ref)), torch.max(torch.abs(inference)))
+    # Convert from frequency to time domain
+    ref_time = torch.fft.ifft2(ref, dim=(1, 2)).real
+    inference_time = torch.fft.ifft2(inference, dim=(1, 2)).real
+
+    maximum = torch.max(
+        torch.max(torch.abs(ref_time)), torch.max(torch.abs(inference_time))
+    )
 
     print("ref shape:", ref.shape)
     print("inference shape:", inference.shape)
 
-    inference = inference.squeeze(0)
+    inference_time = inference_time.squeeze(0)
 
     # Plot predicted field
     im1 = ax1.imshow(
-        inference.cpu().numpy(), cmap="seismic", vmin=-maximum, vmax=maximum
+        inference_time.cpu().numpy(), cmap="seismic", vmin=-maximum, vmax=maximum
     )
-    ax1.set_title("Predicted Ez")
+    ax1.set_title("Predicted Ez (Time Domain)")
 
     # Plot true field
-    im2 = ax2.imshow(ref.cpu().numpy(), cmap="seismic", vmin=-maximum, vmax=maximum)
-    ax2.set_title("True Ez")
+    im2 = ax2.imshow(
+        ref_time.cpu().numpy(), cmap="seismic", vmin=-maximum, vmax=maximum
+    )
+    ax2.set_title("True Ez (Time Domain)")
 
     # Add colorbar
     fig.colorbar(im1, ax=ax1)
@@ -319,6 +327,8 @@ if __name__ == "__main__":
     eps_samples, mu_samples, src_samples, omega_samples, Ez_samples = generate_data(
         1000, (250, 250)
     )
+
+    Ez_samples = torch.fft.fft2(Ez_samples, dim=(1, 2))
 
     # Create dataset and dataloader
     dataset = TensorDataset(
