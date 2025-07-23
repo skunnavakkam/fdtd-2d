@@ -53,14 +53,14 @@ def run_fdfd(eps: torch.Tensor, mu: torch.Tensor, source: torch.Tensor, dx, omeg
     b = -1j * source_np.flatten() * omega
 
     # Solve and convert back to torch tensor
-    solution_np = scipy.sparse.linalg.spsolve(A, b).reshape(eps_np.shape).real
-    return torch.from_numpy(solution_np).to(torch.float32).to(eps.device)
+    solution_np = scipy.sparse.linalg.spsolve(A, b).reshape(eps_np.shape)
+    return torch.from_numpy(solution_np).to(torch.cfloat).to(eps.device)
 
 
 def generate_random_permittivity(
     dimension: Tuple[int, int],
     device: torch.device = device,
-    dtype: torch.dtype = torch.float32,
+    dtype: torch.dtype = torch.cfloat,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Generate a permittivity field (ε) with diverse patterns including:
@@ -72,26 +72,30 @@ def generate_random_permittivity(
     Features are generated at lower frequencies to create larger-scale patterns.
     """
     # Physical constants
-    eps_0 = 8.85418782e-12  # vacuum permittivity (F/m)
+    eps_0 = 8.85418782e-12 + 0j  # vacuum permittivity (F/m)
     eps_max = 5 * eps_0
-    mu_0 = 1.25663706e-6  # vacuum permeability (H/m)
+    mu_0 = 1.25663706e-6 + 0j  # vacuum permeability (H/m)
 
     # Binary regions with larger Gaussian correlation
-    eps_binary = torch.rand(dimension, dtype=dtype, device=device)
+    eps_binary = torch.rand(dimension, dtype=torch.float32, device=device).to(
+        torch.cfloat
+    )
     kernel_size = 15  # Increased kernel size
     sigma = torch.rand(1).item() * 4.0 + 2.0  # Larger sigma range
-    coords = torch.arange(kernel_size, dtype=dtype, device=device) - (kernel_size // 2)
+    coords = torch.arange(kernel_size, dtype=torch.float32, device=device) - (
+        kernel_size // 2
+    )
     xg, yg = torch.meshgrid(coords, coords, indexing="ij")
     kernel = torch.exp(-(xg**2 + yg**2) / (2 * sigma**2))
     kernel /= kernel.sum()
-    weight = kernel.unsqueeze(0).unsqueeze(0)
+    weight = kernel.unsqueeze(0).unsqueeze(0).to(torch.cfloat)
 
     # Add padding to maintain output size
     padding = kernel_size // 2
     eps_blurred = F.conv2d(
         eps_binary.unsqueeze(0).unsqueeze(0), weight, padding=padding
     )[0, 0]
-    eps = (eps_blurred > 0.5).float() * (eps_max - eps_0) + eps_0
+    eps = (eps_blurred.real > 0.5).to(torch.cfloat) * (eps_max - eps_0) + eps_0
 
     # Uniform permeability field
     mu = torch.full(dimension, mu_0, dtype=dtype, device=device)
@@ -100,7 +104,7 @@ def generate_random_permittivity(
 
 
 def generate_random_source(
-    dimension: Tuple[int, int], dtype=torch.float32, device=device
+    dimension: Tuple[int, int], dtype=torch.cfloat, device=device
 ) -> torch.Tensor:
     """
     Generate a random source configuration with either line or point sources.
@@ -136,18 +140,18 @@ def generate_random_source(
             # Horizontal line
             row = torch.randint(start_x, end_x, (1,)).item()
             start = torch.randint(start_y, end_y - max_line_length, (1,)).item()
-            source[row, start : start + max_line_length] = 1.0
+            source[row, start : start + max_line_length] = 1.0 + 0j
         else:
             # Vertical line
             col = torch.randint(start_y, end_y, (1,)).item()
             start = torch.randint(start_x, end_x - max_line_length, (1,)).item()
-            source[start : start + max_line_length, col] = 1.0
+            source[start : start + max_line_length, col] = 1.0 + 0j
     else:
         # Point source
         # Random position within valid region
         row = torch.randint(start_x, end_x, (1,)).item()
         col = torch.randint(start_y, end_y, (1,)).item()
-        source[row, col] = 1.0
+        source[row, col] = 1.0 + 0j
 
     return source
 
@@ -180,7 +184,7 @@ def generate_data(
         src = generate_random_source(dimension)
 
         # Generate random frequency between 9-30 GHz
-        omega = torch.rand(1, dtype=torch.float32).item() * (30e9 - 18e9) + 18e9
+        omega = (torch.rand(1, dtype=torch.float32).item() * (30e9 - 18e9) + 18e9) + 0j
 
         Ez = run_fdfd(eps, mu, src, 1e-3, omega)
 
@@ -194,7 +198,7 @@ def generate_data(
         torch.stack(eps_samples).to(device),
         torch.stack(mu_samples).to(device),
         torch.stack(src_samples).to(device),
-        torch.tensor(omega_samples, dtype=torch.float32).to(device),
+        torch.tensor(omega_samples, dtype=torch.cfloat).to(device),
         torch.stack(Ez_samples).to(device),
     )
 
@@ -206,11 +210,11 @@ def plot_example():
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 4))
 
-    im1 = ax1.imshow(eps)
+    im1 = ax1.imshow(eps.abs().cpu())
     plt.colorbar(im1, ax=ax1)
     ax1.set_title("Permittivity")
 
-    im2 = ax2.imshow(src)
+    im2 = ax2.imshow(src.abs().cpu())
     plt.colorbar(im2, ax=ax2)
     ax2.set_title("Source")
 
@@ -233,7 +237,7 @@ def plot_noisy_sample(noisy_sample: torch.Tensor):
 
     for t in range(num_timesteps):
         plt.subplot(rows, cols, t + 1)
-        plt.imshow(noisy_sample[t].cpu().numpy(), cmap="bwr", vmin=-0.5, vmax=0.5)
+        plt.imshow(noisy_sample[t].abs().cpu().numpy(), cmap="bwr", vmin=-0.5, vmax=0.5)
         plt.title(f"t={t}")
         plt.axis("off")
 
@@ -245,8 +249,8 @@ def plot_ref_v_inference(ref, inference, path):
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
 
     # Convert from frequency to time domain
-    ref_time = torch.fft.ifft2(ref, dim=(1, 2)).real
-    inference_time = torch.fft.ifft2(inference, dim=(1, 2)).real
+    ref_time = torch.fft.ifft2(ref, dim=(1, 2))
+    inference_time = torch.fft.ifft2(inference, dim=(1, 2))
 
     maximum = torch.max(
         torch.max(torch.abs(ref_time)), torch.max(torch.abs(inference_time))
@@ -259,13 +263,13 @@ def plot_ref_v_inference(ref, inference, path):
 
     # Plot predicted field
     im1 = ax1.imshow(
-        inference_time.cpu().numpy(), cmap="seismic", vmin=-maximum, vmax=maximum
+        inference_time.abs().cpu().numpy(), cmap="seismic", vmin=-maximum, vmax=maximum
     )
     ax1.set_title("Predicted Ez (Time Domain)")
 
     # Plot true field
     im2 = ax2.imshow(
-        ref_time.cpu().numpy(), cmap="seismic", vmin=-maximum, vmax=maximum
+        ref_time.abs().cpu().numpy(), cmap="seismic", vmin=-maximum, vmax=maximum
     )
     ax2.set_title("True Ez (Time Domain)")
 
@@ -297,7 +301,7 @@ def inference(model, eps, mu, src, omega, scheduler, num_inference_steps=50):
     model.eval()
 
     # Start from random noise
-    noise = torch.randn_like(eps)
+    noise = torch.randn_like(eps).to(torch.cfloat)
 
     # Set the scheduler timesteps
     scheduler.set_timesteps(num_inference_steps)
@@ -349,7 +353,7 @@ if __name__ == "__main__":
             optimizer.zero_grad()
 
             # Sample noise to add to Ez
-            noise = torch.randn_like(Ez)
+            noise = torch.randn_like(Ez).to(torch.cfloat)
 
             # Sample a random timestep for each image
             timesteps = torch.randint(
