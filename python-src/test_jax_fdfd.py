@@ -1,8 +1,5 @@
 import numpy as np
-import scipy.sparse as sp
 from main import material_init
-from utils import plot_Ez
-import matplotlib.pyplot as plt
 from fdfd_jax import make_A_jax as make_A_jax
 from fdfd import make_A
 import jax.numpy as jnp
