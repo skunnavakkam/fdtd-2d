@@ -3,11 +3,6 @@ import scipy.sparse as sp
 from main import material_init
 from utils import plot_Ez
 import matplotlib.pyplot as plt
-from fdfd_jax import _make_A as make_A_jax
-from fdfd_jax import run_FDFD_jax
-from scipy.sparse import csr_matrix
-import jax.numpy as jnp
-from fdfd_jax import _make_A_scipy_jax as make_A_scipy_jax
 
 
 def solve_linear(A, b):

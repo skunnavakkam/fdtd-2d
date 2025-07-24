@@ -1,6 +1,6 @@
 import numpy as np
-import jaxtyping
 import matplotlib.pyplot as plt
+import torch
 
 
 def sparse_solve(A, b, numerical: bool = True): ...
@@ -28,7 +28,6 @@ def plot_Ez(Ez, eps, source, path, vmax=20, vmin=-20):
     # Add source points in yellow
     source_points = np.nonzero(source)
     eps_gray[source_points] = 255  # Make source points bright
-    yellow = np.array([255, 255, 0], dtype=np.uint8)  # Yellow color
     for x, y in zip(*source_points):
         eps_gray[
             max(0, x - 1) : min(x + 2, eps_gray.shape[0]),
@@ -48,3 +47,21 @@ def plot_Ez(Ez, eps, source, path, vmax=20, vmin=-20):
     final = (rgb_float * 255).astype(np.uint8)
 
     plt.imsave(path, final)
+
+
+def snr_gamma_weight(
+    timesteps: torch.Tensor, scheduler, gamma: float = 5.0
+) -> torch.Tensor:
+    """
+    Compute w(t) = SNR(t)^gamma / (SNR(t)^gamma + 1)
+    for each timestep in `timesteps` (shape [B]).
+
+    Works with any scheduler that exposes `alphas_cumprod`.
+    """
+    # scheduler.alphas_cumprod is [num_train_timesteps]
+    alphas_cumprod = scheduler.alphas_cumprod.to(timesteps.device)
+    # gather the ᾱ_t for each sample’s t
+    alphas_t = alphas_cumprod[timesteps]  # shape [B]
+    snr_t = alphas_t / (1.0 - alphas_t)  # ᾱ_t / (1−ᾱ_t)
+    w_t = (snr_t**gamma) / (snr_t**gamma + 1.0)
+    return w_t

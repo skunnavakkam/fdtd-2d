@@ -1,20 +1,14 @@
 import torch
-from typing import Tuple, Optional
-
-import torch
-from torch import nn
-
+from typing import Tuple
 from fdfd import make_A
 import scipy.sparse.linalg
 import matplotlib.pyplot as plt
 import torch.nn.functional as F
 from tqdm import trange, tqdm
 from torch.utils.data import TensorDataset, DataLoader
-from torch import nn
-import math
 from diffusion_model import UNet2DModel
-from diffusers import DDIMScheduler
-
+from diffusers import DDPMScheduler
+from utils import snr_gamma_weight
 
 """
 This is inspired by DiffusionPDE. We solve FDFD and use that for denoising diffusion training.
@@ -241,6 +235,23 @@ def plot_noisy_sample(noisy_sample: torch.Tensor):
     plt.show()
 
 
+def importance_sample_timesteps(scheduler, batch_size, device, gamma=1.7):
+    """
+    Draw timesteps with probability proportional to SNR(t)^γ.
+    Works for any scheduler that exposes `alphas_cumprod`.
+    """
+    alphas = scheduler.alphas_cumprod.to(device)  # [T]
+    snr = alphas / (1.0 - alphas)  # [T]
+    weights = snr**gamma  # [T]  un-normalised
+    pdf = weights / weights.sum()  # 1-D distribution
+    cdf = torch.cumsum(pdf, dim=0)
+
+    # inverse-transform sampling
+    u = torch.rand(batch_size, device=device)
+    idx = torch.searchsorted(cdf, u, right=True)  # [B] ints in [0,T)
+    return idx
+
+
 def plot_ref_v_inference(ref, inference, path):
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
 
@@ -314,7 +325,7 @@ def inference(model, eps, mu, src, omega, scheduler, num_inference_steps=50):
 
 if __name__ == "__main__":
     model = UNet2DModel().to(device)
-    scheduler = DDIMScheduler()  # using default values
+    scheduler = DDPMScheduler(beta_schedule="squaredcos_cap_v2")  # using default values
 
     eps_samples, mu_samples, src_samples, omega_samples, Ez_samples = generate_data(
         1000, (250, 250)
@@ -342,8 +353,8 @@ if __name__ == "__main__":
             noise = torch.randn_like(Ez)
 
             # Sample a random timestep for each image
-            timesteps = torch.randint(
-                0, scheduler.num_train_timesteps, (Ez.shape[0],), device=Ez.device
+            timesteps = importance_sample_timesteps(
+                scheduler, eps.shape[0], device, gamma=1.3
             )
 
             # Add noise to Ez according to the schedule
@@ -353,7 +364,9 @@ if __name__ == "__main__":
             pred = model(eps, mu, src, noisy_Ez, timesteps, omega)
 
             # Calculate loss (predict the noise)
-            loss = F.mse_loss(pred, noise)
+            weights = snr_gamma_weight(timesteps, scheduler)  # [B]
+            per_sample_mse = (pred - noise).pow(2).mean(dim=(1, 2))  # -> shape [B]
+            loss = (weights * per_sample_mse).mean()
 
             # Backprop
             loss.backward()

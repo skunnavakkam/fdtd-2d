@@ -91,6 +91,7 @@ We solve this system of equations using a sparse solver like `scipy.sparse.linal
 
 ![The Ring Resonator](assets/ring_resonator.png)
 
+### Rewriting in Jax
 
 ### Diffusion Modelling
 
@@ -99,6 +100,12 @@ Diffusion models are probably very good at solving these types of problems, and 
 We first generate the data by generating random permittivities and sources, and then running the FDFD solver to get Ez fields. Then, with a cosine noise scheduler, we add noise to the Ez fields to train the denoising diffusion model. The noisy steps are shown below.
 
 ![Noisy Steps](assets/diffusion_data.png)
+
+We train the diffusion model with DDPM using SNR loss and a cosine noise scheduler, and after 90 epochs ($90000$ samples), we get the following results.
+
+![Diffusion Model Results](assets/diffusion.png)
+
+The model definitely learns some of the dynamics, and is not perfect, but with time should be a lot more competent! I'm going to run it on ~2000 epochs after this post. 
 
 ### Tiled FDFD
 
