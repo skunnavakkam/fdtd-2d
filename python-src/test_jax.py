@@ -1,4 +1,4 @@
-from fdfd_jax import _kron, _diags, _sp_matmul, _sp_add, _spsolve
+from fdfd_jax import _kron, _diags, _sp_matmul, _spsolve
 from scipy.sparse import kron, diags
 from scipy.sparse.linalg import spsolve
 import jax.numpy as jnp

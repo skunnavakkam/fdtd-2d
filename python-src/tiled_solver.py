@@ -1,5 +1,4 @@
 import numpy as np
-import scipy.sparse as sp
 from fdfd import make_A
 import scipy
 from collections import namedtuple

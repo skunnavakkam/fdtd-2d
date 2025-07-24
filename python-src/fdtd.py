@@ -5,7 +5,6 @@ from main import (
     update_Ez,
     capture_snapshot,
     make_video_from_frames,
-    sinusoidal,
     ricker,
 )
 import tqdm

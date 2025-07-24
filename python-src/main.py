@@ -1,12 +1,8 @@
 import numpy as np
-import PIL
 from PIL import Image
-import matplotlib.pyplot as plt
 import matplotlib.cm as cm
 import os
 import shutil
-import ffmpeg
-import tqdm
 
 if os.path.exists("frames"):
     shutil.rmtree("frames")
