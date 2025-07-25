@@ -25,14 +25,6 @@ def plot_Ez(Ez, eps, source, path, vmax=20, vmin=-20):
         eps_normed = (eps - eps_min) / (eps_max - eps_min)
         # Scale to 128-255 (gray to white) - high permittivity is gray
         eps_gray = ((1 - eps_normed) * 127 + 128).astype(np.uint8)
-    # Add source points in yellow
-    source_points = np.nonzero(source)
-    eps_gray[source_points] = 255  # Make source points bright
-    for x, y in zip(*source_points):
-        eps_gray[
-            max(0, x - 1) : min(x + 2, eps_gray.shape[0]),
-            max(0, y - 1) : min(y + 2, eps_gray.shape[1]),
-        ] = 255
 
     # Create RGB array with eps as background
     background = np.stack([eps_gray] * 3, axis=-1)

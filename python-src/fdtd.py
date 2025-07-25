@@ -13,13 +13,13 @@ import numpy as np
 if __name__ == "__main__":
     rows = 200
     cols = 200
-    dt = 1e-12
-    dx = 1e-3
+    dt = 5e-14
+    dx = 1e-4
     nsteps = 1000
     nframes = 200
 
     Ez, Hx, Hy = grid_init(rows, cols)
-    eps, mu = material_init(None, rows, cols)
+    eps, mu = material_init("assets/example_structure.png", rows, cols)
 
     # Check Courant stability condition
     c = 1 / np.sqrt(eps.min() * mu.min())  # Speed of light in material
@@ -31,7 +31,7 @@ if __name__ == "__main__":
         Hx, Hy = update_Hx_Hy(Ez, Hx, Hy, mu, eps, dt, dx)
         Ez = update_Ez(Ez, Hx, Hy, mu, eps, dt, dx)
 
-        Ez += ricker(rows, cols, rows // 2, cols // 2, i * dt, 3e9)
+        Ez += ricker(rows, cols, rows // 2, cols // 2, i * dt, 30e9)
 
         if i % (nsteps // nframes) == 0:
             frame_num = i // (nsteps // nframes)

@@ -30,6 +30,15 @@ $$
 
 ## FDTD
 
+In FDTD, we step through time steps and update the fields at each time step. We update the $E$ field at time $t$ and the $B$/$H$ field at time $t + \frac{1}{2}$ (arb units). Doing this in numpy leads to fast results, which we can later optimize using FNOs.
+
+`fdtd.mp4` shows the propagation of a wave through a medium with varying permittivity:
+
+<video width="100%" controls>
+  <source src="assets/fdtd.mp4" type="video/mp4">
+  Your browser does not support the video tag.
+</video>
+
 ## FDFD
 
 FDTD is an extremely good way to solve Maxwell's equations for transient sources, but oftentimes in photonics simulations we are concenred about the state of a system after a very long time passes, or the steady state. Steady state solutions happen rapidly in light-matter simulations due to the high speed of light! The relation between time-domain and frequency-domain signals by the Fourier transform already gives a hint that we can solve for the steady state at a given frequency!
@@ -92,6 +101,14 @@ We solve this system of equations using a sparse solver like `scipy.sparse.linal
 ![The Ring Resonator](assets/ring_resonator.png)
 
 ### Rewriting in Jax
+
+In the main `fdfd.py` file, the core function is `make_A` which generates the matrix $A$ from the permittivity, permeability, and source. I want to rewrite this in Jax so I can have the ability to backpropagate through it. However, like many other libraries, Jax has *really bad* support for sparse matrices, so we have to go around it and implement other things like our own sparse matrix operations by registering custom forward and backward passes for `scipy.sparse` subroutines.
+
+However, with some help from o3 this works pretty well, and now we can backprop through the FDFD solver and do inverse design to some extent. Let's suppose that we want to do a low pass filter, so only low frequencies of light are allowed to pass through. 
+
+![Inverse Design](assets/inverse_design.png)
+
+Let's start! You can see the code here in `inverse_design.py`.
 
 ### Diffusion Modelling
 

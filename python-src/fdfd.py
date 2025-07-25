@@ -3,10 +3,12 @@ import scipy.sparse as sp
 from main import material_init
 from utils import plot_Ez
 import matplotlib.pyplot as plt
+from fdfd_jax import make_A_jax
+import jax.numpy as jnp
+from fdfd_jax import solve_linear
 
-
-def solve_linear(A, b):
-    return sp.linalg.spsolve(A, b)
+# def solve_linear(A, b):
+#     return sp.linalg.spsolve(A, b)
 
 
 def make_A(eps, mu, dx, dy, Nx, Ny, omega, pml_thickness=40, sigma_max=2, m=3):
@@ -102,7 +104,11 @@ if __name__ == "__main__":
     if dx < lambda_min / 20:
         raise ValueError("dx too small, you're throwing away compute")
 
-    A = make_A(eps, mu, dx, dy, Nx, Ny, omega)
+    eps = jnp.array(eps)
+    mu = jnp.array(mu)
+    source = jnp.array(source)
+
+    A = make_A_jax(eps, mu, dx, dy, Nx, Ny, omega)
     b = omega * source.flatten()
 
     Ez_new = solve_linear(A, b)
