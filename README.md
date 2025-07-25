@@ -34,10 +34,7 @@ In FDTD, we step through time steps and update the fields at each time step. We 
 
 `fdtd.mp4` shows the propagation of a wave through a medium with varying permittivity:
 
-<video width="100%" controls>
-  <source src="assets/fdtd.mp4" type="video/mp4">
-  Your browser does not support the video tag.
-</video>
+![FDTD](assets/fdtd.mp4)
 
 ## FDFD
 
