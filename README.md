@@ -34,8 +34,7 @@ In FDTD, we step through time steps and update the fields at each time step. We 
 
 `fdtd.mp4` shows the propagation of a wave through a medium with varying permittivity:
 
-![FDTD](assets/fdtd.mp4)
-
+https://github.com/skunnavakkam/fdtd-2d/raw/refs/heads/main/assets/fdtd.mp4
 ## FDFD
 
 FDTD is an extremely good way to solve Maxwell's equations for transient sources, but oftentimes in photonics simulations we are concenred about the state of a system after a very long time passes, or the steady state. Steady state solutions happen rapidly in light-matter simulations due to the high speed of light! The relation between time-domain and frequency-domain signals by the Fourier transform already gives a hint that we can solve for the steady state at a given frequency!
